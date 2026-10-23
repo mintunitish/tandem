@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","session_id":"s-fixture","model":"claude-x"}
+{"type":"assistant","message":{"id":"msg_a","role":"assistant","content":[{"type":"text","text":"po"}],"usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000,"output_tokens":4}},"session_id":"s-fixture"}
+{"type":"assistant","message":{"id":"msg_a","role":"assistant","content":[{"type":"text","text":"ng"}],"usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000,"output_tokens":4}},"session_id":"s-fixture"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1900000000,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.22,"resetsAt":1900000000},"seven_day":{"utilization":0.42,"resetsAt":1900500000},"seven_day_overage_included":{"utilization":0.15,"resetsAt":1900500000}}},"session_id":"s-fixture"}
+{"type":"result","subtype":"success","total_cost_usd":0.25,"usage":{"input_tokens":2,"output_tokens":4},"session_id":"s-fixture"}
