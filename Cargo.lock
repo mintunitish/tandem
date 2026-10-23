@@ -8133,13 +8133,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
- "chrono",
  "clap",
  "dirs 6.0.0",
  "futures",
+ "libsqlite3-sys",
  "regex",
  "rmcp",
- "schemars 1.2.3",
  "security-framework",
  "serde",
  "serde_json",
@@ -8181,10 +8180,12 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tandem-acp",
  "tandem-core",
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
