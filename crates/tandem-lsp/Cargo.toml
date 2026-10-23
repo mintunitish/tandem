@@ -7,6 +7,21 @@ license.workspace = true
 [dependencies]
 tandem-core.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+async-channel.workspace = true
+parking_lot.workspace = true
+lsp-types.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# Minimal scripted LSP server used by the integration tests (tests/client.rs).
+[[bin]]
+name = "tandem-fake-lsp"
+path = "tests/fixtures/fake_lsp.rs"
+test = false
+doc = false
