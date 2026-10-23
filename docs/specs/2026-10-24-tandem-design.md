@@ -100,3 +100,6 @@ Headline: **"Your three AI subscriptions, one unlimited agent. And none of them 
 5. Intent-conflict radar: phase 2.
 
 Build order change: Phase 1 adds `tandem-quota`. Phase 2 UI ships cockpit + quota gauge + kill switch + blame first; DB panel and full editor polish after the demo path works end to end.
+
+## Built-in skill packs (added 2026-10-24)
+`tandem-skills`: ships curated agent skills in the open SKILL.md format (superpowers, ponytail, caveman, gstack, plus Tandem's own: review, db-safety, harness). Per task, the chosen packs are materialized into the worktree (`.claude/skills/`, `.codex/skills/`, `.agents/skills/`, and an `AGENTS.md` index block) so every agent sees the same instructions. Toggles in the cockpit: Lazy (ponytail), Terse (caveman), TDD/brainstorm (superpowers), Review/ship (gstack). Licenses verified before bundling; packs vendored under `skills/` with their LICENSE files. Users can add their own packs; marketplace later.

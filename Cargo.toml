@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/tandem-ide/tandem"
+rust-version = "1.90"
+
+[workspace.dependencies]
+tandem-core = { path = "crates/tandem-core" }
+tandem-acp = { path = "crates/tandem-acp" }
+tandem-git = { path = "crates/tandem-git" }
+tandem-lsp = { path = "crates/tandem-lsp" }
+tandem-project = { path = "crates/tandem-project" }
+tandem-terminal = { path = "crates/tandem-terminal" }
+tandem-db = { path = "crates/tandem-db" }
+tandem-sandbox = { path = "crates/tandem-sandbox" }
+tandem-review = { path = "crates/tandem-review" }
+tandem-quota = { path = "crates/tandem-quota" }
+tandem-harness = { path = "crates/tandem-harness" }
+tandem-skills = { path = "crates/tandem-skills" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+async-channel = "2"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1"
+parking_lot = "0.12"
+dirs = "6"
+tempfile = "3"
+similar = "2"
+tree-sitter = "0.25"
+agent-client-protocol = "3"
+git2 = "0.20"
+lsp-types = "0.97"
+notify = "8"
+ignore = "0.4"
+grep = "0.3"
+portable-pty = "0.9"
+alacritty_terminal = "0.25"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "chrono", "json", "any"] }
+clap = { version = "4", features = ["derive"] }
+gpui-kit = { version = "0.8", features = ["tree-sitter-languages"] }
+
+[profile.dev]
+opt-level = 0
+[profile.dev.package."*"]
+opt-level = 2
+[profile.release]
+lto = "thin"
+codegen-units = 4
