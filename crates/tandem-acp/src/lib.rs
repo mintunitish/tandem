@@ -1,1 +1,11 @@
-//! tandem-acp: see docs/specs/2026-10-24-tandem-design.md. Implemented in phase 1.
+//! tandem-acp: ACP client that spawns unmodified vendor agent binaries and streams
+//! [`tandem_core::AgentEvent`]s. See docs/specs/2026-10-24-tandem-design.md.
+
+pub mod client;
+pub mod log;
+mod map;
+pub mod registry;
+
+pub use client::{AcpAgent, AgentHandle, DefaultClassifier, McpServerSpec, PermissionClassifier};
+pub use log::ReplayLog;
+pub use registry::{Availability, DetectedAgent, builtin, detect_installed, get};

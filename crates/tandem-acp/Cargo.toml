@@ -10,3 +10,23 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+agent-client-protocol = { workspace = true, features = ["unstable_end_turn_token_usage"] }
+tokio.workspace = true
+futures.workspace = true
+async-channel.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "tandem-acp-fake-agent"
+path = "src/bin/fake_agent.rs"
+test = false
+doc = false
+
+[[example]]
+name = "acp_demo"
+path = "examples/acp_demo.rs"
