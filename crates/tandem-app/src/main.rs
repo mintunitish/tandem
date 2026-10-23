@@ -1,1 +1,3 @@
-fn main() { println!("tandem: phase 2"); }
+fn main() {
+    tandem_app::run();
+}

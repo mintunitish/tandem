@@ -4,10 +4,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "tandem"
 path = "src/main.rs"
 
+[features]
+test-support = ["gpui-kit/test-support"]
+
 [dependencies]
 tandem-core.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+ignore.workspace = true
+gpui-kit.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
