@@ -68,6 +68,7 @@ pub struct LeaderRow {
     /// 0..=100.
     pub pass_rate: f64,
     pub median_time_s: f64,
+    /// Input + output + cache read + cache write.
     pub tokens: u64,
     pub cost_usd: Option<f64>,
     /// pass% − 0.1 × normalized time (median / slowest median × 100).
@@ -164,7 +165,8 @@ impl Report {
                     passed,
                     pass_rate: passed as f64 * 100.0 / runs.len() as f64,
                     median_time_s: median(&mut times),
-                    tokens: usage.input_tokens + usage.output_tokens,
+                    // Real agents put most of the prompt in cache reads/writes; count them too.
+                    tokens: usage.input_tokens + usage.output_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
                     cost_usd: usage.cost_usd,
                     score: 0.0,
                 })

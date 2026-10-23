@@ -4,7 +4,7 @@
 use crate::eval::{self, CheckResult, EvalCtx};
 use crate::report::{Report, RunKind, RunResult, Status};
 use crate::runner::{AgentRunner, PermissionDecider};
-use crate::scenario::{BenchTask, Fixture, Scenario};
+use crate::scenario::{BenchTask, Category, Fixture, Scenario};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use std::io::Write;
@@ -28,6 +28,14 @@ pub struct RunOptions {
     pub date: String,
     /// Label stored in the report (`mock`, `acp`).
     pub runner_name: String,
+    /// Upper bound on any scenario/bench timeout (not on `cancel_after_s`).
+    pub max_timeout_s: Option<f64>,
+}
+
+impl RunOptions {
+    fn cap(&self, t: f64) -> f64 {
+        self.max_timeout_s.map_or(t, |m| t.min(m))
+    }
 }
 
 impl RunOptions {
@@ -38,6 +46,7 @@ impl RunOptions {
             out_dir: harness_root.join("reports").join(&date),
             date,
             runner_name: runner_name.into(),
+            max_timeout_s: None,
         }
     }
 }
@@ -246,7 +255,7 @@ async fn scenario_inner(agent: &AgentId, s: &Scenario, runner: &dyn AgentRunner,
     let decider = s.decider.build()?;
     let (deadline, cancel) = match s.cancel_after_s {
         Some(c) => (c, true),
-        None => (s.timeout_s.unwrap_or(300.0), false),
+        None => (opts.cap(s.timeout_s.unwrap_or(300.0)), false),
     };
     let log = log_path(opts, agent, &s.id, 0);
     let d = drive(runner, agent, &ws.work, &s.prompt, decider, Duration::from_secs_f64(deadline), cancel, &log).await?;
@@ -291,7 +300,8 @@ async fn bench_inner(agent: &AgentId, t: &BenchTask, runner: &dyn AgentRunner, r
     let ws = Workspace::create(&t.fixture, &opts.fixtures_dir, &[])?;
     let decider = t.decider.build()?;
     let log = log_path(opts, agent, &t.id, repeat);
-    let deadline = Duration::from_secs_f64(t.timeout_s);
+    let timeout_s = opts.cap(t.timeout_s);
+    let deadline = Duration::from_secs_f64(timeout_s);
     let d = drive(runner, agent, &ws.work, &t.prompt, decider, deadline, false, &log).await?;
     r.log = Some(rel(opts, &log));
     r.elapsed_s = d.elapsed.as_secs_f64();
@@ -304,7 +314,7 @@ async fn bench_inner(agent: &AgentId, t: &BenchTask, runner: &dyn AgentRunner, r
     }
     if d.timed_out {
         r.status = Status::Fail;
-        r.reason = format!("timed out after {}s", t.timeout_s);
+        r.reason = format!("timed out after {timeout_s}s");
         return Ok(());
     }
     if let Some(h) = &t.hidden {
@@ -333,13 +343,39 @@ async fn bench_inner(agent: &AgentId, t: &BenchTask, runner: &dyn AgentRunner, r
     Ok(())
 }
 
-/// Runs every scenario against every agent, sequentially.
+/// Short reason for skipping the rest of an agent's scenarios after a failed preflight.
+fn preflight_reason(id: &str, why: &str) -> String {
+    let lower = why.to_lowercase();
+    let auth = ["auth", "login", "log in", "unauthorized", "401", "403", "credential", "api key", "api_key"]
+        .iter()
+        .any(|n| lower.contains(n));
+    let tag = if auth { "auth required" } else { "preflight failed" };
+    format!("{tag} (`{id}`: {})", crate::eval::tail(why, 160))
+}
+
+/// Runs every scenario against every agent, sequentially. `preflight`
+/// scenarios run first; if one fails, the agent's remaining scenarios are skipped.
 pub async fn conformance(agents: &[AgentId], scenarios: &[Scenario], runner: Arc<dyn AgentRunner>, opts: &RunOptions) -> Report {
+    let mut ordered: Vec<&Scenario> = scenarios.iter().collect();
+    ordered.sort_by_key(|s| s.category != Category::Preflight);
     let mut results = Vec::new();
     for agent in agents {
-        for s in scenarios {
+        let mut blocked: Option<String> = None;
+        for s in &ordered {
+            if let Some(why) = &blocked {
+                let mut r = base_result(RunKind::Conformance, agent, &s.id, &s.title, Some(s.category.as_str().into()), 0);
+                r.reason = why.clone();
+                results.push(r);
+                continue;
+            }
             tracing::info!(agent = %agent, scenario = %s.id, "conformance");
-            results.push(run_scenario(agent, s, runner.as_ref(), opts).await);
+            eprintln!("[conformance] {agent} / {} ...", s.id);
+            let r = run_scenario(agent, s, runner.as_ref(), opts).await;
+            eprintln!("[conformance] {agent} / {} -> {:?} {}", s.id, r.status, crate::eval::tail(&r.reason, 200));
+            if s.category == Category::Preflight && r.status == Status::Fail {
+                blocked = Some(preflight_reason(&s.id, &r.reason));
+            }
+            results.push(r);
         }
     }
     Report::new(&opts.date, &opts.runner_name, results)
@@ -352,7 +388,10 @@ pub async fn bench(agents: &[AgentId], tasks: &[BenchTask], runner: Arc<dyn Agen
         for t in tasks {
             for rep in 0..repeats.max(1) {
                 tracing::info!(agent = %agent, task = %t.id, rep, "bench");
-                results.push(run_bench_task(agent, t, runner.as_ref(), rep, opts).await);
+                eprintln!("[bench] {agent} / {} #{rep} ...", t.id);
+                let r = run_bench_task(agent, t, runner.as_ref(), rep, opts).await;
+                eprintln!("[bench] {agent} / {} #{rep} -> {:?} {}", t.id, r.status, crate::eval::tail(&r.reason, 200));
+                results.push(r);
             }
         }
     }

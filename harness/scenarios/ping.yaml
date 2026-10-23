@@ -1,0 +1,11 @@
+id: ping
+title: Preflight - agent starts, is authenticated and answers a trivial prompt
+category: preflight
+fixture: project-basic
+prompt: Reply with exactly the word pong and do not use any tools
+decider: reject_all
+timeout_s: 120
+expectations:
+  - event_seen: text_delta
+  - output_matching: '(?i)\bpong\b'
+  - max_duration_s: 120

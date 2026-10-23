@@ -19,6 +19,7 @@ fn opts(out: &Path) -> RunOptions {
         out_dir: out.to_path_buf(),
         date: "2026-10-24".into(),
         runner_name: "mock".into(),
+        max_timeout_s: None,
     }
 }
 
@@ -314,6 +315,11 @@ fn eval_structured_diff_matches_disk() {
     assert!(!fx.eval("structured_diff_matches_disk", &ev));
     std::fs::write(fx.ws.work.join("src/a.ts"), "let a = 2;\n").unwrap();
     assert!(fx.eval("structured_diff_matches_disk", &ev));
+    // Fragment-style diffs (claude-agent-acp) pass when the fragment is on disk.
+    std::fs::write(fx.ws.work.join("src/a.ts"), "// head\nlet a = 2;\n// tail\n").unwrap();
+    assert!(fx.eval("structured_diff_matches_disk", &ev));
+    std::fs::write(fx.ws.work.join("src/a.ts"), "let a = 3;\n").unwrap();
+    assert!(!fx.eval("structured_diff_matches_disk", &ev));
 }
 
 #[test]

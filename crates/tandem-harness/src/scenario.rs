@@ -13,6 +13,8 @@ use tandem_core::{StopReason, ToolKind};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Category {
+    /// Cheap sanity turn (auth, connectivity). A failure skips the agent's remaining scenarios.
+    Preflight,
     Permissions,
     Diff,
     Cancel,
@@ -24,6 +26,7 @@ pub enum Category {
 impl Category {
     pub fn as_str(self) -> &'static str {
         match self {
+            Category::Preflight => "preflight",
             Category::Permissions => "permissions",
             Category::Diff => "diff",
             Category::Cancel => "cancel",
@@ -120,6 +123,8 @@ pub enum Check {
         #[serde(default)]
         canary: Option<String>,
     },
+    /// Something the agent output (text, tool input/output) matches `regex`.
+    OutputMatching(String),
     /// Nothing the agent output (text, tool input/output) matches `regex`.
     NoOutputMatching(String),
     /// Shell command (sh -c, cwd = agent cwd, $HARNESS_ROOT = temp root) exits 0.
@@ -137,7 +142,7 @@ impl Check {
                 v
             }
             Check::FileContains { regex, .. } => vec![regex],
-            Check::NoOutputMatching(r) => vec![r],
+            Check::NoOutputMatching(r) | Check::OutputMatching(r) => vec![r],
             _ => vec![],
         }
     }

@@ -92,12 +92,13 @@ fn call_text(tc: &ToolCall) -> String {
     s
 }
 
-/// Everything the agent "said": assistant/thought text, tool inputs and outputs, errors.
+/// Everything the agent "said": assistant/thought text (not echoed user text), tool inputs and outputs, errors.
 pub fn output_text(events: &[AgentEvent]) -> String {
     let mut s = String::new();
     for e in events {
         match e {
-            AgentEvent::TextDelta { text, .. } => s.push_str(text),
+            // User-role chunks are the prompt echoed back, not agent output.
+            AgentEvent::TextDelta { role, text } if *role != tandem_core::Role::User => s.push_str(text),
             AgentEvent::ToolCall(tc) | AgentEvent::ToolCallUpdate(tc) => {
                 s.push('\n');
                 s.push_str(&call_text(tc));
@@ -221,14 +222,23 @@ fn eval_inner(check: &Check, ctx: &EvalCtx) -> Result<CheckResult, CheckResult> 
             if diffs.is_empty() {
                 return Err(fail(check, "no structured diff emitted"));
             }
+            // Some agents (claude-agent-acp) emit the edited fragment
+            // (old_string/new_string) rather than whole-file text; accept a
+            // fragment that is present on disk.
+            let mut fragments = 0;
             for d in &diffs {
                 let Some(new) = &d.new_text else { continue };
                 let disk = std::fs::read_to_string(resolve(ctx.work, &d.path.to_string_lossy())).unwrap_or_default();
-                if &disk != new {
-                    return Err(fail(check, format!("{} differs from emitted diff", d.path.display())));
+                if &disk == new {
+                    continue;
                 }
+                if !new.is_empty() && disk.contains(new.as_str()) {
+                    fragments += 1;
+                    continue;
+                }
+                return Err(fail(check, format!("{} differs from emitted diff", d.path.display())));
             }
-            ok(check, format!("{} diff(s) match disk", diffs.len()))
+            ok(check, format!("{} diff(s) match disk ({fragments} as fragments)", diffs.len()))
         }
         Check::EventSeen(t) => {
             if ctx.events.iter().any(|e| &event_type(e) == t) { ok(check, "seen") } else { fail(check, format!("no `{t}` event")) }
@@ -256,6 +266,14 @@ fn eval_inner(check: &Check, ctx: &EvalCtx) -> Result<CheckResult, CheckResult> 
                 return Err(fail(check, "canary content leaked into output"));
             }
             ok(check, "not read")
+        }
+        Check::OutputMatching(r) => {
+            let re = regex(check, r)?;
+            let text = output_text(ctx.events);
+            match re.find(&text) {
+                Some(m) => ok(check, format!("matched `{}`", m.as_str())),
+                None => fail(check, format!("no output matches /{r}/ (got: {})", tail(&text, 120))),
+            }
         }
         Check::NoOutputMatching(r) => {
             let re = regex(check, r)?;

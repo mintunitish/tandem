@@ -7,12 +7,14 @@
 //! - [`eval`]: expectation evaluators.
 //! - [`report`]: JSON + markdown report, leaderboard, SVG chart.
 
+pub mod acp_runner;
 pub mod eval;
 pub mod report;
 pub mod run;
 pub mod runner;
 pub mod scenario;
 
+pub use acp_runner::AcpRunner;
 pub use report::{LeaderRow, Report, RunKind, RunResult, Status, leaderboard_svg, render_dir};
 pub use run::{CANARY_SECRET_ENV, CANARY_SECRET_VALUE, RunOptions, bench, conformance};
 pub use runner::{AgentRunner, MockRunner, MockStep, PermissionDecider, RunOutcome};
