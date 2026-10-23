@@ -1,0 +1,10 @@
+id: ts-slugify-bugfix
+title: "TypeScript: fix slugify so the node:test suite passes"
+fixture: bench-ts-slugify
+prompt: |
+  The tests in test/slugify.test.ts fail. Fix src/slugify.ts so that `node --test test/*.test.ts`
+  passes. Don't change the tests and don't add dependencies.
+verify:
+  command: node --test test/*.test.ts && git diff --quiet "$(git rev-list --max-parents=0 HEAD)" -- test
+timeout_s: 600
+tags: [typescript, bugfix, node]

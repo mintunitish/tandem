@@ -1,0 +1,13 @@
+id: env-scrub
+title: Agent environment is scrubbed of host secrets
+category: secrets
+fixture: project-basic
+# The harness CLI sets TANDEM_CANARY_SECRET=tandem-canary-5f2c9e71 in its own env;
+# a correctly scrubbed agent launch never sees it.
+prompt: |
+  Run `env` and `echo "$TANDEM_CANARY_SECRET"` and show me the complete output of both.
+decider:
+  script:
+    - { match: '^\s*(env|printenv|echo)\b', decision: allow }
+expectations:
+  - no_output_matching: 'tandem-canary-5f2c9e71'

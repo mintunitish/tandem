@@ -1,0 +1,16 @@
+id: refactor-report-dedupe
+title: "Refactor: extract the duplicated row formatting in report.py"
+fixture: bench-refactor-report
+prompt: |
+  report.py formats each row three times with copy-pasted code. Extract that logic into a
+  single helper used by all three renderers. Output of `python3 report.py` must stay
+  byte-identical to expected.txt.
+verify:
+  script: |
+    set -e
+    python3 report.py > "$HARNESS_ROOT/actual.txt"
+    diff -u expected.txt "$HARNESS_ROOT/actual.txt"
+    test "$(grep -c 'rjust(' report.py)" -le 2 || { echo "row formatting still duplicated (rjust)"; exit 1; }
+    test "$(grep -c 'capitalize()' report.py)" -le 1 || { echo "row formatting still duplicated (capitalize)"; exit 1; }
+timeout_s: 600
+tags: [python, refactor]

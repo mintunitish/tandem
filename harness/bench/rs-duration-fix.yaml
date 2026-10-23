@@ -1,0 +1,14 @@
+id: rs-duration-fix
+title: "Rust: make parse_duration's unit tests pass"
+fixture: bench-rs-duration
+prompt: |
+  `cargo test` fails in this crate. Fix `parse_duration` in src/lib.rs so all unit tests
+  pass. Don't change the tests and don't add dependencies.
+verify:
+  script: |
+    set -e
+    [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+    CARGO_TARGET_DIR="$HARNESS_ROOT/target" cargo test --offline -q
+    grep -q 'Some(7510)' src/lib.rs
+timeout_s: 900
+tags: [rust, bugfix, cargo]

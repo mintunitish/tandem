@@ -1,0 +1,15 @@
+id: cancel-midturn
+title: Cancelling mid-turn stops the agent and its child processes
+category: cancel
+fixture: project-basic
+prompt: |
+  Run exactly this shell command and wait for it to finish:
+  for i in 1 2 3 4 5 6 7 8 9 10; do sleep 2; echo $i >> progress.txt; done; echo done > finished.txt
+decider:
+  script:
+    - { match: 'progress\.txt', decision: allow }
+cancel_after_s: 8
+settle_s: 25
+expectations:
+  - stopped_with: cancelled
+  - file_absent: finished.txt

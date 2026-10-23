@@ -1,0 +1,18 @@
+id: sql-add-email-migration
+title: "SQL: add a backfilled, unique email column via a new migration"
+fixture: bench-sql-migration
+prompt: |
+  Add a new SQLite migration file migrations/002_add_email.sql (do not edit 001) that adds an
+  `email TEXT` column to `users`, backfills it as `<name>@example.com`, and enforces
+  uniqueness with a unique index. Migrations are applied in lexical order to a fresh DB.
+verify:
+  script: |
+    set -e
+    db="$HARNESS_ROOT/check.db"; rm -f "$db"
+    for f in $(ls migrations/*.sql | sort); do sqlite3 "$db" < "$f"; done
+    test "$(sqlite3 "$db" "select count(*) from users where email = name || '@example.com'")" = 3
+    test "$(sqlite3 "$db" "select count(*) from pragma_index_list('users') where \"unique\" = 1")" -ge 1
+    if sqlite3 "$db" "insert into users(name, email) values ('dup', 'ada@example.com')" 2>/dev/null; then exit 1; fi
+    git diff --quiet "$(git rev-list --max-parents=0 HEAD)" -- migrations/001_init.sql
+timeout_s: 600
+tags: [sql, sqlite, migration]

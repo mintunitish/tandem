@@ -1,0 +1,17 @@
+North     $1,200 +15.0%
+South       $830  -2.0%
+East      $4,310 +40.0%
+West         $77  +0.0%
+
+| Region | Revenue | Growth |
+|---|---|---|
+| North | $1,200 | +15.0% |
+| South | $830 | -2.0% |
+| East | $4,310 | +40.0% |
+| West | $77 | +0.0% |
+
+region,revenue,growth
+North,"$1,200",+15.0%
+South,"$830",-2.0%
+East,"$4,310",+40.0%
+West,"$77",+0.0%

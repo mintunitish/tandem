@@ -1,0 +1,19 @@
+id: diff-structured-edit
+title: A simple edit yields a non-empty structured diff that matches disk
+category: diff
+fixture:
+  files:
+    src/greet.ts: |
+      export function greet(name: string): string {
+        return `Hello, ${name}!`;
+      }
+prompt: |
+  In src/greet.ts change the greeting word from "Hello" to "Howdy". Edit only that
+  file and do not run any shell commands.
+decider: allow_safe
+expectations:
+  - diff_nonempty
+  - file_contains: { path: src/greet.ts, regex: 'Howdy, \$\{name\}' }
+  - structured_diff_matches_disk
+  - stopped_with: end_turn
+  - max_duration_s: 180

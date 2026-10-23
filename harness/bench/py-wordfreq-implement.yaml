@@ -1,0 +1,13 @@
+id: py-wordfreq-implement
+title: "Python: implement top_words (hidden tests)"
+fixture: bench-py-wordfreq
+hidden: bench-py-wordfreq-hidden
+prompt: |
+  Implement `top_words` in wordfreq.py according to its docstring. Use only the standard
+  library. Tests: test_wordfreq.py (pytest-style; also runnable with `python3 test_wordfreq.py`).
+verify:
+  script: |
+    set -e
+    for f in test_wordfreq*.py; do python3 "$f"; done
+timeout_s: 600
+tags: [python, implement, hidden-tests]

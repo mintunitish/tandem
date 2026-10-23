@@ -4,9 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "tandem-harness"
+path = "src/main.rs"
+
 [dependencies]
 tandem-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+async-channel.workspace = true
+clap.workspace = true
+chrono.workspace = true
 tracing.workspace = true
+tempfile.workspace = true
+regex.workspace = true
+async-trait = "0.1"
