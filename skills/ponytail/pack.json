@@ -1,0 +1,1 @@
+{"id":"ponytail","name":"Ponytail (lazy mode)","description":"Forces the simplest solution that works: YAGNI, stdlib first, fewest lines.","license":"MIT","upstream":"https://github.com/DietrichGebert/ponytail","always_on":["ponytail"]}

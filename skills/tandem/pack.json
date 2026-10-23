@@ -1,0 +1,1 @@
+{"id":"tandem","name":"Tandem","description":"Tandem's own skills: diff review checklist, database safety, worktree etiquette, harness conformance.","license":"Apache-2.0","upstream":"https://github.com/tandem-ide/tandem","always_on":["tandem-worktree-etiquette","tandem-db-safety"]}

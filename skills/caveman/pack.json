@@ -1,0 +1,1 @@
+{"id":"caveman","name":"Caveman (terse mode)","description":"Ultra-compressed communication that cuts output tokens while keeping technical accuracy.","license":"MIT","upstream":"https://github.com/JuliusBrussee/caveman","always_on":["caveman"]}
