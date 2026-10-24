@@ -103,3 +103,10 @@ Build order change: Phase 1 adds `tandem-quota`. Phase 2 UI ships cockpit + quot
 
 ## Built-in skill packs (added 2026-10-24)
 `tandem-skills`: ships curated agent skills in the open SKILL.md format (superpowers, ponytail, caveman, gstack, plus Tandem's own: review, db-safety, harness). Per task, the chosen packs are materialized into the worktree (`.claude/skills/`, `.codex/skills/`, `.agents/skills/`, and an `AGENTS.md` index block) so every agent sees the same instructions. Toggles in the cockpit: Lazy (ponytail), Terse (caveman), TDD/brainstorm (superpowers), Review/ship (gstack). Licenses verified before bundling; packs vendored under `skills/` with their LICENSE files. Users can add their own packs; marketplace later.
+
+## Known gaps (v0.1)
+- **DB MCP under sandbox.** With `policy.sandbox` on, `tandem-db-mcp` would run inside the agent's Seatbelt profile and cannot read `~/.tandem/db/connections.json`, the Keychain password or the confirm file, so exposed connections are not attached (the task gets a note and a warn log). Planned fix: an IDE-hosted MCP server plus an in-sandbox stdio proxy over a Unix socket.
+- **Claude Code under Tandem's Seatbelt.** Claude Code is not runnable inside Tandem's profile (Keychain access). Planned: a vendored sandbox via a `CLAUDE_CODE_EXECUTABLE` wrapper.
+- **Transcript is not virtualized**; very long sessions render every item.
+- **Replay log may contain raw JSON-RPC payloads** (`AgentEvent::Raw`), including anything an agent echoes.
+- **Restore reads whole logs** into memory instead of streaming them.

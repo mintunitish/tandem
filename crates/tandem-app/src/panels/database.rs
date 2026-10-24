@@ -97,6 +97,8 @@ struct ConnNode {
 
 pub struct DatabasePanel {
     pub root: PathBuf,
+    /// Cached from the policy file at construction and on `reload()`; read per render otherwise.
+    sandbox_on: bool,
     store: Option<Arc<ConnectionStore>>,
     store_error: Option<String>,
     pub connections: Vec<ConnectionConfig>,
@@ -124,6 +126,7 @@ impl DatabasePanel {
         let form = cx.new(|cx| ConnectionForm::new(window, cx));
         let mut this = Self {
             exposure: DbAgents::load(&root),
+            sandbox_on: crate::state::load_policy(&root).0.sandbox,
             root,
             store,
             store_error,
@@ -157,6 +160,7 @@ impl DatabasePanel {
     }
 
     pub fn reload(&mut self) {
+        self.sandbox_on = crate::state::load_policy(&self.root).0.sandbox;
         if let Some(s) = &self.store {
             match s.list() {
                 Ok(list) => self.connections = list,
@@ -538,6 +542,7 @@ impl DatabasePanel {
 
     fn render_tree(&self, p: &Palette, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut tree: Vec<AnyElement> = Vec::new();
+        let sandbox_on = self.sandbox_on;
         for (i, c) in self.connections.iter().enumerate() {
             let node = self.nodes.get(&c.name);
             let open = node.is_some_and(|n| n.open);
@@ -577,6 +582,7 @@ impl DatabasePanel {
                             this.set_exposed(&n2, *on, cx);
                         })),
                     )
+                    .when(sandbox_on, |d| d.child(div().text_size(px(11.)).text_color(p.muted).child("Requires sandbox off (v0.1)")))
                     .when_some(exposed, |d, e| {
                         let label = if e.allow_write { "read + write" } else { "read-only" };
                         let color = if e.allow_write { p.warning } else { p.ok };

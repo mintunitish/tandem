@@ -88,6 +88,14 @@ async fn run(spec: StartSpec, pool: Option<Arc<QuotaPool>>, ui: async_channel::S
         let (root, id, presets) = (root.clone(), id.clone(), presets.clone());
         tokio::task::spawn_blocking(move || prepare(&root, &id, &presets)).await.context("prepare task")??
     };
+    let mut notes = notes;
+    let (mcp, sandbox_note) = gate_mcp_for_sandbox(&policy, mcp);
+    if let Some(note) = sandbox_note {
+        tracing::warn!(task = %id, "{note}");
+        // The "attached via MCP" notes from `db::mcp_specs` no longer hold.
+        notes.retain(|n| !n.contains("attached via MCP"));
+        notes.push(note.to_string());
+    }
     ui.send(TaskMsg::Prepared { worktree: worktree.clone(), base: base.clone(), notes }).await.ok();
 
     // 2. Replay log. The prompt reaches it (and the UI) through the event stream:
@@ -110,6 +118,16 @@ async fn run(spec: StartSpec, pool: Option<Arc<QuotaPool>>, ui: async_channel::S
     // 5. First turn. Events stream through the forwarder meanwhile; follow-up prompts reuse `handle`.
     let _ = handle.prompt(prompt).await;
     Ok(())
+}
+
+/// Shown when exposed database connections are withheld because the task runs sandboxed.
+pub const DB_SANDBOX_NOTICE: &str = "Database access for agents needs the sandbox off for this task (v0.1 limitation). Toggle Sandbox in Settings → Policy or use the Database panel yourself.";
+
+/// v0.1 limitation: `tandem-db-mcp` would be spawned inside the agent's Seatbelt profile and
+/// could not read `connections.json`, the Keychain password or the confirm file. With the
+/// sandbox on, the MCP specs are therefore not attached (and the user is told why).
+fn gate_mcp_for_sandbox(policy: &Policy, mcp: Vec<McpServerSpec>) -> (Vec<McpServerSpec>, Option<&'static str>) {
+    if policy.sandbox && !mcp.is_empty() { (vec![], Some(DB_SANDBOX_NOTICE)) } else { (mcp, None) }
 }
 
 fn prepare(root: &Path, id: &TaskId, presets: &[Preset]) -> Result<(PathBuf, String, Vec<String>)> {
@@ -350,6 +368,18 @@ pub fn task_meta(t: &AgentTask) -> tandem_review::TaskMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_withholds_db_mcp() {
+        let spec = McpServerSpec { name: "db".into(), command: "x".into(), args: vec![], env: Default::default() };
+        let on = Policy { sandbox: true, ..Policy::default() };
+        let off = Policy { sandbox: false, ..Policy::default() };
+        let (m, note) = gate_mcp_for_sandbox(&on, vec![spec.clone()]);
+        assert!(m.is_empty() && note == Some(DB_SANDBOX_NOTICE));
+        assert!(gate_mcp_for_sandbox(&on, vec![]).1.is_none());
+        let (m, note) = gate_mcp_for_sandbox(&off, vec![spec]);
+        assert!(m.len() == 1 && note.is_none());
+    }
 
     #[test]
     fn strips_index_block() {
