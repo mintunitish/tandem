@@ -1,5 +1,5 @@
 //! Tandem IDE application crate: the gpui-kit shell (WebStorm New UI layout) and its panels.
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 pub mod app;
 pub mod assets;
@@ -7,10 +7,12 @@ pub mod editor;
 pub mod keymap;
 pub mod model;
 pub mod panels;
+pub mod runtime;
 pub mod search_everywhere;
 pub mod settings;
 pub mod state;
 pub mod statusbar;
+pub mod tasks;
 pub mod stripes;
 pub mod theme;
 pub mod titlebar;

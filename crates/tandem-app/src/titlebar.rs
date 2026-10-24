@@ -106,10 +106,13 @@ pub fn render(info: &TitleInfo, p: &Palette) -> impl IntoElement {
 
     let waiting = info.agents_waiting > 0;
     let pill_color = if waiting { p.error } else if info.agents_running > 0 { p.ok } else { p.muted };
+    let agents = |n: usize| if n == 1 { "1 agent".to_string() } else { format!("{n} agents") };
     let pill_text = if waiting {
-        format!("{} agents · {} needs approval", info.agents_running, info.agents_waiting)
+        format!("{} · {} need{} approval", agents(info.agents_running), info.agents_waiting, if info.agents_waiting == 1 { "s" } else { "" })
+    } else if info.agents_running > 0 {
+        format!("{} running", agents(info.agents_running))
     } else {
-        format!("{} agents running", info.agents_running)
+        "No agents running".to_string()
     };
     let pill = div()
         .id("tb-agents")

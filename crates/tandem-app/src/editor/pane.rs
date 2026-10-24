@@ -1,20 +1,34 @@
+use super::actions::{FindUsages, ReformatCode, RenameSymbol};
+use super::find::FindPanel;
+use super::lsp::{self, LspHub, LspHubEvent, LspProviders};
 use super::ops::{self, Edit};
-use super::{breadcrumbs, tabs};
+use super::usages::{Usage, UsagesPanel};
+use super::{breadcrumbs, gutter, tabs};
 use crate::assets::{language_for, line_comment};
+use crate::stripes::ToolWindowId;
 use crate::theme::{MONO_FONT, pal};
 use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
-use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, Position, TabSize};
+use gpui_kit::component::highlighter::Diagnostic;
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, Position, RopeExt as _, TabSize};
 use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use tandem_git::GutterMark;
+use tandem_lsp::lsp_types as lspt;
 
 pub struct OpenFile {
     pub path: PathBuf,
     pub state: Entity<EditorState>,
     pub dirty: bool,
     pub language: &'static str,
+    /// Hash of the text last loaded from / written to disk.
+    saved_hash: u64,
+    /// Working-tree vs HEAD change marks (refreshed on open and save).
+    pub git_marks: Vec<GutterMark>,
     _subs: Vec<Subscription>,
 }
 
@@ -22,6 +36,10 @@ pub enum EditorAreaEvent {
     ActiveChanged(Option<PathBuf>),
     CursorMoved,
     Toast(SharedString),
+    /// A file was written by ⌘S.
+    Saved(PathBuf),
+    /// Ask the workspace to show a tool window (Usages / Find results live in Problems).
+    ShowToolWindow(ToolWindowId),
 }
 
 pub struct EditorArea {
@@ -32,9 +50,14 @@ pub struct EditorArea {
     pub recent: Vec<PathBuf>,
     pub hovered_tab: Option<usize>,
     pub font_size: f32,
+    pub lsp: Entity<LspHub>,
+    pub find: Entity<FindPanel>,
+    pub usages: Entity<UsagesPanel>,
     focus: FocusHandle,
     go_to_line: Entity<InputState>,
+    rename_input: Entity<InputState>,
     tab_scroll: ScrollHandle,
+    _subs: Vec<Subscription>,
 }
 
 impl EventEmitter<EditorAreaEvent> for EditorArea {}
@@ -51,9 +74,27 @@ impl Focusable for EditorArea {
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
+fn hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
 impl EditorArea {
     pub fn new(root: PathBuf, font_size: f32, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let go_to_line = cx.new(|cx| InputState::new(window, cx));
+        let rename_input = cx.new(|cx| InputState::new(window, cx));
+        let lsp = cx.new(|cx| LspHub::new(root.clone(), cx));
+        let me = cx.weak_entity();
+        let find = cx.new(|cx| FindPanel::new(root.clone(), me.clone(), window, cx));
+        let usages = cx.new(|_| UsagesPanel::new(root.clone(), me));
+        let subs = vec![cx.subscribe(&lsp, |this, _, ev: &LspHubEvent, cx| {
+            if let LspHubEvent::Diagnostics(path) = ev {
+                this.apply_diagnostics(path, cx);
+            }
+            cx.notify();
+        })];
         Self {
             root,
             files: vec![],
@@ -61,9 +102,14 @@ impl EditorArea {
             recent: vec![],
             hovered_tab: None,
             font_size,
+            lsp,
+            find,
+            usages,
             focus: cx.focus_handle(),
             go_to_line,
+            rename_input,
             tab_scroll: ScrollHandle::new(),
+            _subs: subs,
         }
     }
 
@@ -73,6 +119,10 @@ impl EditorArea {
 
     pub fn active_path(&self) -> Option<PathBuf> {
         self.active_file().map(|f| f.path.clone())
+    }
+
+    fn file(&self, path: &Path) -> Option<&OpenFile> {
+        self.files.iter().find(|f| f.path == path)
     }
 
     fn touch_recent(&mut self, path: &Path) {
@@ -106,6 +156,7 @@ impl EditorArea {
             }
         };
         let language = language_for(&path);
+        let saved_hash = hash(&content);
         let state = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language(language)
@@ -116,22 +167,47 @@ impl EditorArea {
                 .tab_size(TabSize { tab_size: 4, hard_tabs: false })
                 .default_value(content)
         });
+        if self.lsp.read(cx).manager.config_for(&path).is_some() {
+            let providers = Rc::new(LspProviders { hub: self.lsp.clone(), path: path.clone(), area: cx.weak_entity() });
+            lsp::install(&state, providers, cx);
+            let weak = state.downgrade();
+            self.lsp.update(cx, |hub, cx| hub.open(&path, weak, cx));
+        }
         let path_for_sub = path.clone();
         let subs = vec![
-            cx.subscribe(&state, move |this, _, ev: &InputEvent, cx| {
-                if matches!(ev, InputEvent::Change)
-                    && let Some(f) = this.files.iter_mut().find(|f| f.path == path_for_sub)
-                    && !f.dirty
-                {
-                    f.dirty = true;
-                    cx.notify();
+            cx.subscribe(&state, move |this, state, ev: &InputEvent, cx| {
+                if !matches!(ev, InputEvent::Change) {
+                    return;
+                }
+                let text = state.read(cx).value();
+                this.lsp.update(cx, |hub, _| hub.change(&path_for_sub, &text));
+                if let Some(f) = this.files.iter_mut().find(|f| f.path == path_for_sub) {
+                    let dirty = hash(&text) != f.saved_hash;
+                    if dirty != f.dirty {
+                        f.dirty = dirty;
+                        cx.notify();
+                    }
                 }
             }),
             cx.observe(&state, |_, _, cx| cx.emit(EditorAreaEvent::CursorMoved)),
         ];
         let at = self.active.map(|a| a + 1).unwrap_or(self.files.len());
-        self.files.insert(at, OpenFile { path, state, dirty: false, language, _subs: subs });
+        self.files.insert(at, OpenFile { path: path.clone(), state, dirty: false, language, saved_hash, git_marks: vec![], _subs: subs });
+        self.refresh_git_marks(&path, cx);
+        self.apply_diagnostics(&path, cx);
         self.activate(at, window, cx);
+    }
+
+    /// Open `path` and put the caret at `pos` (0-based line / UTF-16 column).
+    pub fn open_at(&mut self, path: PathBuf, pos: lspt::Position, window: &mut Window, cx: &mut Context<Self>) {
+        self.open(path.clone(), window, cx);
+        if let Some(f) = self.file(&path) {
+            let state = f.state.clone();
+            state.update(cx, |s, cx| {
+                s.set_cursor_position(Position::new(pos.line, pos.character), window, cx);
+                s.focus(window, cx);
+            });
+        }
     }
 
     pub fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -152,7 +228,8 @@ impl EditorArea {
         if ix >= self.files.len() {
             return;
         }
-        self.files.remove(ix);
+        let closed = self.files.remove(ix);
+        self.lsp.update(cx, |hub, _| hub.close(&closed.path));
         if self.files.is_empty() {
             self.active = None;
             window.focus(&self.focus, cx);
@@ -184,15 +261,78 @@ impl EditorArea {
         self.activate(((cur + delta).rem_euclid(n)) as usize, window, cx);
     }
 
+    /// ⌘S: write every modified buffer, `didSave` it and refresh its gutter marks.
     pub fn save_all(&mut self, cx: &mut Context<Self>) {
+        let mut saved = Vec::new();
         for f in self.files.iter_mut().filter(|f| f.dirty) {
             let text = f.state.read(cx).value();
             match std::fs::write(&f.path, text.as_bytes()) {
-                Ok(()) => f.dirty = false,
+                Ok(()) => {
+                    f.dirty = false;
+                    f.saved_hash = hash(&text);
+                    saved.push(f.path.clone());
+                }
                 Err(err) => cx.emit(EditorAreaEvent::Toast(format!("Save failed: {err}").into())),
             }
         }
+        for path in saved {
+            self.lsp.update(cx, |hub, _| hub.save(&path));
+            self.refresh_git_marks(&path, cx);
+            cx.emit(EditorAreaEvent::Saved(path));
+        }
         cx.notify();
+    }
+
+    /// Reload unmodified open buffers whose file changed on disk (external edits, Replace in
+    /// Files, git checkout).
+    pub fn reload_from_disk(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        for f in self.files.iter_mut().filter(|f| !f.dirty && paths.contains(&f.path)) {
+            let Ok(text) = std::fs::read_to_string(&f.path) else { continue };
+            let h = hash(&text);
+            if h == f.saved_hash {
+                continue;
+            }
+            f.saved_hash = h;
+            f.state.update(cx, |s, cx| s.set_value(text, window, cx));
+        }
+        let paths = paths.to_vec();
+        for p in paths {
+            if self.file(&p).is_some() {
+                self.refresh_git_marks(&p, cx);
+            }
+        }
+    }
+
+    pub fn refresh_git_marks(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let (root, p) = (self.root.clone(), path.to_path_buf());
+        let task = cx.background_spawn(async move {
+            tandem_git::Repo::open(&root).ok().and_then(|r| r.per_line_gutter_marks(&p).ok()).unwrap_or_default()
+        });
+        let p = path.to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let marks = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(f) = this.files.iter_mut().find(|f| f.path == p) {
+                    f.git_marks = marks;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn apply_diagnostics(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(f) = self.file(path) else { return };
+        let mut diags = self.lsp.read(cx).diagnostics.get(path).cloned().unwrap_or_default();
+        diags.sort_by_key(|d| (d.range.start.line, d.range.start.character));
+        f.state.update(cx, |s, cx| {
+            let text = s.text().clone();
+            if let Some(set) = s.diagnostics_mut() {
+                set.reset(&text);
+                set.extend(diags.into_iter().map(Diagnostic::from));
+            }
+            cx.notify();
+        });
     }
 
     /// Run a pure line command against the active buffer as one undoable replacement.
@@ -232,6 +372,16 @@ impl EditorArea {
         })
     }
 
+    /// Selected text of the active editor (single line), to seed Find in Files.
+    pub fn selected_text(&self, cx: &App) -> Option<String> {
+        let f = self.active_file()?;
+        let s = f.state.read(cx);
+        let r = s.selected_range();
+        let text = s.text().to_string();
+        let sel = text.get(r.start.min(r.end)..r.start.max(r.end))?.to_string();
+        (!sel.is_empty() && !sel.contains('\n')).then_some(sel)
+    }
+
     pub fn go_to_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(file) = self.active_file() else { return };
         let editor = file.state.clone();
@@ -264,6 +414,210 @@ impl EditorArea {
                 })
         });
     }
+
+    /// `(path, text, byte offset of caret)` of the active buffer.
+    fn caret(&self, cx: &App) -> Option<(PathBuf, String, usize)> {
+        let f = self.active_file()?;
+        let s = f.state.read(cx);
+        Some((f.path.clone(), s.text().to_string(), s.cursor()))
+    }
+
+    fn no_server(&self, path: &Path, cx: &mut Context<Self>) {
+        let msg = match &self.lsp.read(cx).missing {
+            Some((server, hint)) => format!("No language server: install {server}: {hint}"),
+            None => format!("No language server for {}", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+        };
+        cx.emit(EditorAreaEvent::Toast(msg.into()));
+    }
+
+    /// ⇧F6: rename the symbol at the caret via LSP, applying the edit to every file.
+    pub fn rename_symbol(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, text, offset)) = self.caret(cx) else { return };
+        if !self.lsp.read(cx).is_open(&path) {
+            return self.no_server(&path, cx);
+        }
+        let word = lsp::word_prefix(&text, offset).start..{
+            let rest = &text[offset..];
+            offset + rest.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')).unwrap_or(rest.len())
+        };
+        let old = text[word].to_string();
+        let input = self.rename_input.clone();
+        input.update(cx, |s, cx| {
+            s.set_value(old.clone(), window, cx);
+            s.select_all(window, cx);
+        });
+        let me = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            input.update(cx, |s, cx| s.focus(window, cx));
+            let input_ok = input.clone();
+            let (me, path, text) = (me.clone(), path.clone(), text.clone());
+            dialog
+                .title(format!("Rename '{old}'"))
+                .w(px(380.))
+                .child(v_flex().gap(px(6.)).child(div().text_size(px(12.)).text_color(pal(cx).muted).child("Rename symbol and its usages to:")).child(Input::new(&input)))
+                .on_ok(move |_, window, cx| {
+                    let new_name = input_ok.read(cx).value().trim().to_string();
+                    if new_name.is_empty() {
+                        return false;
+                    }
+                    let (path, text) = (path.clone(), text.clone());
+                    let _ = me.update(cx, |this, cx| this.run_rename(path, text, offset, new_name, window, cx));
+                    true
+                })
+        });
+    }
+
+    fn run_rename(&mut self, path: PathBuf, text: String, offset: usize, new_name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let pos = lsp::position(&text, offset);
+        let rx = self.lsp.update(cx, |hub, _| hub.request(&path, Some(&text), move |c, p| async move { c.rename(&p, pos, &new_name).await }));
+        let Some(rx) = rx else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let res = lsp::recv(rx).await;
+            let _ = this.update_in(cx, |this, window, cx| match res {
+                Ok(edit) => {
+                    let (files, edits) = this.apply_workspace_edit(&edit, window, cx);
+                    cx.emit(EditorAreaEvent::Toast(format!("Renamed {edits} occurrence(s) in {files} file(s)").into()));
+                }
+                Err(err) => cx.emit(EditorAreaEvent::Toast(format!("Rename failed: {err}").into())),
+            });
+        })
+        .detach();
+    }
+
+    /// ⌥F7: LSP references → Usages tool window.
+    pub fn find_usages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, text, offset)) = self.caret(cx) else { return };
+        if !self.lsp.read(cx).is_open(&path) {
+            return self.no_server(&path, cx);
+        }
+        let range = lsp::word_prefix(&text, offset);
+        let rest = &text[offset..];
+        let end = offset + rest.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')).unwrap_or(rest.len());
+        let symbol = text[range.start..end].to_string();
+        let pos = lsp::position(&text, offset);
+        let rx = self.lsp.update(cx, |hub, _| hub.request(&path, Some(&text), move |c, p| async move { c.references(&p, pos, true).await }));
+        let Some(rx) = rx else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let res = lsp::recv(rx).await;
+            let _ = this.update(cx, |this, cx| match res {
+                Ok(locs) => {
+                    let usages = this.usages_from(locs, cx);
+                    this.usages.update(cx, |u, cx| u.set(symbol, usages, cx));
+                    cx.emit(EditorAreaEvent::ShowToolWindow(ToolWindowId::Problems));
+                }
+                Err(err) => cx.emit(EditorAreaEvent::Toast(format!("Find Usages failed: {err}").into())),
+            });
+        })
+        .detach();
+    }
+
+    fn line_text(&self, path: &Path, line: u32, cx: &App) -> String {
+        let text = match self.file(path) {
+            Some(f) => f.state.read(cx).value().to_string(),
+            None => std::fs::read_to_string(path).unwrap_or_default(),
+        };
+        text.lines().nth(line as usize).unwrap_or("").to_string()
+    }
+
+    fn usages_from(&self, locs: Vec<lspt::Location>, cx: &App) -> Vec<Usage> {
+        let mut out: Vec<Usage> = locs
+            .into_iter()
+            .filter_map(|l| {
+                let path = tandem_lsp::uri_to_path(&l.uri)?;
+                let line_text = self.line_text(&path, l.range.start.line, cx);
+                Some(Usage { path, pos: l.range.start, line_text })
+            })
+            .collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path).then(a.pos.line.cmp(&b.pos.line)));
+        out
+    }
+
+    /// ⌘⌥L: LSP formatting of the active file.
+    pub fn reformat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, text, _)) = self.caret(cx) else { return };
+        if !self.lsp.read(cx).is_open(&path) {
+            return self.no_server(&path, cx);
+        }
+        let rx = self.lsp.update(cx, |hub, _| hub.request(&path, Some(&text), |c, p| async move { c.format_document(&p, 4, true).await }));
+        let Some(rx) = rx else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let res = lsp::recv(rx).await;
+            let _ = this.update_in(cx, |this, window, cx| match res {
+                Ok(edits) if !edits.is_empty() => {
+                    let mut map = HashMap::new();
+                    map.insert(path, edits);
+                    this.apply_edits(map, window, cx);
+                }
+                Ok(_) => {}
+                Err(err) => cx.emit(EditorAreaEvent::Toast(format!("Reformat failed: {err}").into())),
+            });
+        })
+        .detach();
+    }
+
+    /// Apply an LSP `WorkspaceEdit`: open buffers are edited in place (undoable), other files
+    /// are rewritten on disk. Returns `(files, edits)` touched.
+    pub fn apply_workspace_edit(&mut self, edit: &lspt::WorkspaceEdit, window: &mut Window, cx: &mut Context<Self>) -> (usize, usize) {
+        self.apply_edits(workspace_edit_by_file(edit), window, cx)
+    }
+
+    fn apply_edits(&mut self, by_file: HashMap<PathBuf, Vec<lspt::TextEdit>>, window: &mut Window, cx: &mut Context<Self>) -> (usize, usize) {
+        let (mut files, mut count) = (0, 0);
+        let mut written = Vec::new();
+        for (path, mut edits) in by_file {
+            // Apply back to front so earlier ranges stay valid.
+            edits.sort_by_key(|e| std::cmp::Reverse((e.range.start.line, e.range.start.character)));
+            count += edits.len();
+            files += 1;
+            if let Some(f) = self.file(&path) {
+                f.state.update(cx, |s, cx| s.apply_lsp_edits(&edits, window, cx));
+            } else if let Ok(mut text) = std::fs::read_to_string(&path) {
+                for e in &edits {
+                    let r = tandem_lsp::range_to_offsets(&text, e.range);
+                    text.replace_range(r, &e.new_text);
+                }
+                if std::fs::write(&path, text).is_ok() {
+                    written.push(path);
+                }
+            }
+        }
+        for p in written {
+            cx.emit(EditorAreaEvent::Saved(p));
+        }
+        (files, count)
+    }
+}
+
+/// Flatten `changes` and `documentChanges` into per-file text edits.
+pub fn workspace_edit_by_file(edit: &lspt::WorkspaceEdit) -> HashMap<PathBuf, Vec<lspt::TextEdit>> {
+    let mut out: HashMap<PathBuf, Vec<lspt::TextEdit>> = HashMap::new();
+    if let Some(changes) = &edit.changes {
+        for (uri, edits) in changes {
+            if let Some(p) = tandem_lsp::uri_to_path(uri) {
+                out.entry(p).or_default().extend(edits.iter().cloned());
+            }
+        }
+    }
+    let mut doc_edit = |e: &lspt::TextDocumentEdit| {
+        if let Some(p) = tandem_lsp::uri_to_path(&e.text_document.uri) {
+            out.entry(p).or_default().extend(e.edits.iter().map(|x| match x {
+                lspt::OneOf::Left(t) => t.clone(),
+                lspt::OneOf::Right(a) => a.text_edit.clone(),
+            }));
+        }
+    };
+    match &edit.document_changes {
+        Some(lspt::DocumentChanges::Edits(edits)) => edits.iter().for_each(&mut doc_edit),
+        Some(lspt::DocumentChanges::Operations(ops)) => {
+            for op in ops {
+                if let lspt::DocumentChangeOperation::Edit(e) = op {
+                    doc_edit(e);
+                }
+            }
+        }
+        None => {}
+    }
+    out
 }
 
 impl BasePanel for EditorArea {
@@ -297,14 +651,30 @@ impl Render for EditorArea {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal(cx).clone();
         let body: AnyElement = match self.active_file() {
-            Some(f) => Editor::new(&f.state)
-                .bordered(false)
-                .p_0()
-                .h_full()
-                .font_family(MONO_FONT)
-                .text_size(px(self.font_size))
-                .line_height(relative(1.2))
-                .into_any_element(),
+            Some(f) => {
+                let editor = Editor::new(&f.state)
+                    .bordered(false)
+                    .p_0()
+                    .h_full()
+                    .font_family(MONO_FONT)
+                    .text_size(px(self.font_size))
+                    .line_height(relative(1.2));
+                let diags = self.lsp.read(cx).diagnostics.get(&f.path).cloned().unwrap_or_default();
+                let lines = f.state.read(cx).text().lines_len().max(1);
+                h_flex()
+                    .size_full()
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(editor)
+                            .child(gutter::change_marks(f.state.clone(), f.git_marks.clone(), &p)),
+                    )
+                    .child(gutter::error_stripe(f.state.clone(), &diags, &f.git_marks, lines, &p))
+                    .into_any_element()
+            }
             None => empty_state(&p).into_any_element(),
         };
         v_flex()
@@ -312,6 +682,9 @@ impl Render for EditorArea {
             .track_focus(&self.focus)
             .size_full()
             .bg(p.editor_bg)
+            .on_action(cx.listener(|this, _: &RenameSymbol, window, cx| this.rename_symbol(window, cx)))
+            .on_action(cx.listener(|this, _: &FindUsages, window, cx| this.find_usages(window, cx)))
+            .on_action(cx.listener(|this, _: &ReformatCode, window, cx| this.reformat(window, cx)))
             .when(!self.files.is_empty(), |d| {
                 d.child(tabs::render_tab_strip(self, &self.tab_scroll, &p, window, cx))
                     .child(breadcrumbs::render(&self.root, self.active_file().map(|f| f.path.as_path()), &p))
@@ -337,4 +710,30 @@ fn empty_state(p: &crate::theme::Palette) -> impl IntoElement {
             .child(row("Agents", "⌥⌘A"))
             .child(row("Drop files here to open them", "")),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use std::str::FromStr;
+
+    #[test]
+    #[allow(clippy::mutable_key_type)]
+    fn workspace_edit_flattens_both_shapes() {
+        let uri = lspt::Uri::from_str("file:///tmp/a.ts").unwrap();
+        let te = lspt::TextEdit::new(lspt::Range::default(), "x".into());
+        let mut changes = HashMap::new();
+        changes.insert(uri.clone(), vec![te.clone()]);
+        let edit = lspt::WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: Some(lspt::DocumentChanges::Edits(vec![lspt::TextDocumentEdit {
+                text_document: lspt::OptionalVersionedTextDocumentIdentifier { uri, version: None },
+                edits: vec![lspt::OneOf::Left(te)],
+            }])),
+            change_annotations: None,
+        };
+        let m = workspace_edit_by_file(&edit);
+        assert_eq!(m[&PathBuf::from("/tmp/a.ts")].len(), 2);
+    }
 }

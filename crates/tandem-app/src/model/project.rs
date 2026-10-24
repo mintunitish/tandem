@@ -1,119 +1,122 @@
-//! In-crate stand-in for `tandem-project`: lazy directory listing for the Project tree and a
-//! flat file index for Search Everywhere. Swap these two functions for the backend crate later.
+//! Project services behind the Project tree, Search Everywhere (files + symbols), Find in Files,
+//! Structure and Recent Files: a background `tandem_project::FileIndex` + `SymbolIndex`, a live
+//! `Watcher` that keeps both in sync, and the persisted `RecentFiles` ring.
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use crate::editor::{EditorArea, EditorAreaEvent};
+use gpui_kit::*;
+use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tandem_project::{FileIndex, FsEvent, RecentFiles, SymbolIndex, Watcher};
 
-/// Names never shown in the tree.
-pub fn is_always_hidden_name(name: &str) -> bool {
-    matches!(name, ".git" | ".tandem" | ".DS_Store")
+pub enum ProjectModelEvent {
+    /// A debounced filesystem change (already applied to the indexes).
+    Fs(FsEvent),
+    /// The file and/or symbol index finished building.
+    Indexed,
 }
 
-/// Directories shown, but collapsed and dimmed ("excluded" in JetBrains terms).
-pub fn is_excluded_name(name: &str) -> bool {
-    matches!(name, "node_modules" | "target" | "dist" | "build" | ".idea" | ".next")
+pub struct ProjectModel {
+    pub root: PathBuf,
+    pub files: Arc<RwLock<FileIndex>>,
+    pub symbols: Arc<RwLock<SymbolIndex>>,
+    pub recent: RecentFiles,
+    pub files_ready: bool,
+    pub symbols_ready: bool,
+    _watcher: Option<Watcher>,
+    _tasks: Vec<Task<()>>,
+    _sub: Subscription,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DirEntry {
-    pub path: PathBuf,
-    pub name: String,
-    pub is_dir: bool,
-    /// Gitignored or a well-known build/output dir. Rendered dimmed.
-    pub excluded: bool,
-}
+impl EventEmitter<ProjectModelEvent> for ProjectModel {}
 
-/// Root-level `.gitignore` matcher, built once per project.
-pub struct IgnoreRules {
-    gitignore: Gitignore,
-}
+impl ProjectModel {
+    pub fn new(root: PathBuf, editor: &Entity<EditorArea>, cx: &mut Context<Self>) -> Self {
+        let files = Arc::new(RwLock::new(FileIndex::default()));
+        let symbols = Arc::new(RwLock::new(SymbolIndex::default()));
+        let recent = RecentFiles::load(&root);
+        let mut tasks = Vec::new();
 
-impl IgnoreRules {
-    pub fn new(root: &Path) -> Self {
-        let mut b = GitignoreBuilder::new(root);
-        b.add(root.join(".gitignore"));
-        let gitignore = b.build().unwrap_or_else(|_| Gitignore::empty());
-        Self { gitignore }
-    }
+        let (r, f) = (root.clone(), files.clone());
+        let recent_list = recent.list();
+        let build_files = cx.background_spawn(async move {
+            let mut idx = FileIndex::build(r);
+            idx.set_recent(&recent_list);
+            *f.write() = idx;
+        });
+        tasks.push(cx.spawn(async move |this, cx| {
+            build_files.await;
+            let _ = this.update(cx, |m, cx| {
+                m.files_ready = true;
+                cx.emit(ProjectModelEvent::Indexed);
+                cx.notify();
+            });
+        }));
+        let (r, s) = (root.clone(), symbols.clone());
+        let build_symbols = cx.background_spawn(async move {
+            let idx = SymbolIndex::build(r);
+            *s.write() = idx;
+        });
+        tasks.push(cx.spawn(async move |this, cx| {
+            build_symbols.await;
+            let _ = this.update(cx, |m, cx| {
+                m.symbols_ready = true;
+                cx.emit(ProjectModelEvent::Indexed);
+                cx.notify();
+            });
+        }));
 
-    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        self.gitignore.matched_path_or_any_parents(path, is_dir).is_ignore()
-    }
-}
-
-/// List one directory: directories first, then files, both case-insensitively sorted.
-/// Integration point: `tandem_project::tree::list_dir(root, dir)`.
-pub fn list_dir(dir: &Path, rules: &IgnoreRules) -> Vec<DirEntry> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
-    let mut out: Vec<DirEntry> = rd
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            if is_always_hidden_name(&name) {
-                return None;
-            }
-            let path = e.path();
-            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            let excluded = (is_dir && is_excluded_name(&name)) || rules.is_ignored(&path, is_dir);
-            Some(DirEntry { path, name, is_dir, excluded })
-        })
-        .collect();
-    out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
-    out
-}
-
-/// Every non-ignored file under `root`, relative paths. Runs on a background thread.
-/// Integration point: `tandem_project::fuzzy::FileIndex::build(root)`.
-pub fn index_files(root: &Path, limit: usize) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !is_always_hidden_name(&name) && !is_excluded_name(&name)
-        })
-        .build();
-    for entry in walker.flatten() {
-        if entry.file_type().is_some_and(|t| t.is_file()) {
-            if let Ok(rel) = entry.path().strip_prefix(root) {
-                files.push(rel.to_path_buf());
-            }
-            if files.len() >= limit {
-                break;
-            }
+        let watcher = Watcher::new(&root).ok();
+        if let Some(w) = &watcher {
+            let rx = w.events();
+            let (f, s) = (files.clone(), symbols.clone());
+            let executor = cx.background_executor().clone();
+            tasks.push(cx.spawn(async move |this, cx| {
+                while let Ok(ev) = rx.recv().await {
+                    let (f, s, ev2) = (f.clone(), s.clone(), ev.clone());
+                    executor
+                        .spawn(async move {
+                            f.write().apply_event(&ev2);
+                            s.write().apply_event(&ev2);
+                        })
+                        .await;
+                    if this.update(cx, |_, cx| cx.emit(ProjectModelEvent::Fs(ev))).is_err() {
+                        break;
+                    }
+                }
+            }));
         }
+
+        let sub = cx.subscribe(editor, |this: &mut Self, _, ev: &EditorAreaEvent, _| {
+            if let EditorAreaEvent::ActiveChanged(Some(path)) = ev {
+                this.touch_recent(path);
+            }
+        });
+        Self { root, files, symbols, recent, files_ready: false, symbols_ready: false, _watcher: watcher, _tasks: tasks, _sub: sub }
     }
-    files.sort();
-    files
+
+    pub fn touch_recent(&mut self, path: &Path) {
+        self.recent.touch(path);
+        let list = self.recent.list();
+        self.files.write().set_recent(&list);
+    }
+
+    /// Recent files (absolute, most recent first) that still exist.
+    pub fn recent_files(&self) -> Vec<PathBuf> {
+        self.recent.list().into_iter().filter(|p| p.exists()).collect()
+    }
 }
 
-/// Current branch from `.git/HEAD` (cheap, no git2). Integration point: `tandem_git::current_branch`.
+/// Current branch name (or short detached HEAD id), via libgit2.
 pub fn current_branch(root: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(root.join(".git/HEAD")).ok()?;
-    let head = head.trim();
-    Some(match head.strip_prefix("ref: refs/heads/") {
-        Some(b) => b.to_string(),
-        None => head.chars().take(8).collect(),
-    })
+    let repo = tandem_git::Repo::open(root).ok()?;
+    match repo.current_branch() {
+        Ok(Some(b)) => Some(b),
+        _ => repo.head_id().ok().flatten().map(|id| id.chars().take(8).collect()),
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dirs_first_and_hidden_names() {
-        let tmp = std::env::temp_dir().join(format!("tandem-app-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("b_dir")).unwrap();
-        std::fs::create_dir_all(tmp.join(".git")).unwrap();
-        std::fs::create_dir_all(tmp.join("node_modules")).unwrap();
-        std::fs::write(tmp.join("a.rs"), "").unwrap();
-        let rules = IgnoreRules::new(&tmp);
-        let entries = list_dir(&tmp, &rules);
-        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["b_dir", "node_modules", "a.rs"]);
-        assert!(entries[1].excluded);
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
+/// Every indexed file (relative, `/`-separated). Kept for callers that only need a flat list.
+pub fn index_files(root: &Path, limit: usize) -> Vec<PathBuf> {
+    FileIndex::build(root).paths().iter().take(limit).map(PathBuf::from).collect()
 }

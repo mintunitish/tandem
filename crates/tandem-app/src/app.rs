@@ -61,6 +61,7 @@ pub fn init(theme_override: Option<ThemeKind>, cx: &mut App) {
     theme::apply(settings.theme, settings.editor_font_size, cx);
     cx.set_global(settings);
     keymap::bind_keys(cx);
+    crate::editor::actions::bind_keys(cx);
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &ToggleTheme, cx| crate::settings::toggle_theme(cx));
     cx.set_menus(vec![
@@ -154,7 +155,7 @@ fn screenshot(handle: AnyWindowHandle, out: PathBuf, cx: &mut App) {
         cx.background_executor().timer(std::time::Duration::from_millis(2500)).await;
         let _ = cx.update_window(handle, |_, window, cx| {
             window.refresh();
-            window.draw(cx);
+            let _ = window.draw(cx);
             match window.render_to_image() {
                 Ok(img) => match img.save(&out) {
                     Ok(()) => eprintln!("tandem: wrote {}", out.display()),

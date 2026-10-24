@@ -4,12 +4,13 @@
 
 use crate::editor::{EditorArea, EditorAreaEvent};
 use crate::keymap::*;
+use crate::model::project::{ProjectModel, ProjectModelEvent};
 use crate::model::{self, project};
 use crate::panels::agents::{AgentsEvent, AgentsPanel};
 use crate::panels::database::DatabasePanel;
 use crate::panels::git::{CommitPanel, GitLogPanel};
 use crate::panels::harness::HarnessPanel;
-use crate::panels::misc::ListPanel;
+use crate::panels::misc::{ListPanel, ProblemsPanel, StructurePanel};
 use crate::panels::project::{ProjectEvent, ProjectPanel};
 use crate::panels::review::{ReviewEvent, ReviewPanel};
 use crate::panels::terminal::TerminalPanel;
@@ -27,11 +28,9 @@ use gpui_kit::component::{WindowExt as _, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const FILE_INDEX_LIMIT: usize = 100_000;
 const DOUBLE_SHIFT: Duration = Duration::from_millis(400);
 
 fn placement(side: Side) -> DockPlacement {
@@ -53,8 +52,9 @@ pub struct Workspace {
     tool_windows: HashMap<ToolWindowId, Entity<ToolWindow>>,
     pub layout: LayoutState,
     pub search: Option<Entity<SearchPopup>>,
-    files: Arc<Vec<PathBuf>>,
-    indexing: bool,
+    pub project_model: Entity<ProjectModel>,
+    pub terminal: Entity<TerminalPanel>,
+    pub problems: Entity<ProblemsPanel>,
     branch: String,
     focus: FocusHandle,
     last_shift: Option<Instant>,
@@ -73,33 +73,35 @@ impl Workspace {
         let root = root.canonicalize().unwrap_or(root);
         let settings = cx.global::<AppSettings>().clone();
         let branch = project::current_branch(&root).unwrap_or_else(|| "main".into());
-        let git_changes = model::fake_git_changes();
 
         let editor = cx.new(|cx| EditorArea::new(root.clone(), settings.editor_font_size, window, cx));
         let status = cx.new(|cx| StatusBarView::new(editor.clone(), branch.clone(), 0, cx));
-        let project = cx.new(|cx| ProjectPanel::new(root.clone(), &git_changes, cx));
-        let agents = cx.new(|cx| AgentsPanel::new(window, cx));
-        let review = cx.new(ReviewPanel::new);
+        let project = cx.new(|cx| ProjectPanel::new(root.clone(), window, cx));
+        let agents = cx.new(|cx| AgentsPanel::new(root.clone(), window, cx));
+        let review = cx.new(|cx| ReviewPanel::new(root.clone(), cx));
         let terminal = cx.new(|cx| TerminalPanel::new(&root, cx));
-        let commit = cx.new(|cx| CommitPanel::new(git_changes.clone(), window, cx));
-        let git_log = cx.new(|_| GitLogPanel::new(commit.clone()));
-        let database = cx.new(|cx| DatabasePanel::new(window, cx));
-        let harness = cx.new(|cx| HarnessPanel::new(window, cx));
+        let commit = cx.new(|cx| CommitPanel::new(root.clone(), &editor, window, cx));
+        let git_log = cx.new(|cx| GitLogPanel::new(root.clone(), cx));
+        let project_model = cx.new(|cx| ProjectModel::new(root.clone(), &editor, cx));
+        let problems = cx.new(|cx| ProblemsPanel::new(&editor, cx));
+        let structure = cx.new(|cx| StructurePanel::new(&editor, &project_model, cx));
+        let database = cx.new(|cx| DatabasePanel::new(root.clone(), window, cx));
+        let harness = cx.new(|cx| HarnessPanel::new(root.clone(), window, cx));
         let running = agents.read(cx).model.running_count();
         status.update(cx, |s, _| s.agents_running = running);
 
         let mut views: Vec<(ToolWindowId, AnyView)> = vec![
             (ToolWindowId::Project, project.clone().into()),
             (ToolWindowId::Commit, commit.into()),
-            (ToolWindowId::Structure, cx.new(|_| ListPanel::structure()).into()),
+            (ToolWindowId::Structure, structure.into()),
             (ToolWindowId::Bookmarks, cx.new(|_| ListPanel::bookmarks()).into()),
             (ToolWindowId::Agents, agents.clone().into()),
             (ToolWindowId::Review, review.clone().into()),
             (ToolWindowId::Database, database.into()),
             (ToolWindowId::Notifications, cx.new(|_| ListPanel::notifications()).into()),
-            (ToolWindowId::Terminal, terminal.into()),
+            (ToolWindowId::Terminal, terminal.clone().into()),
             (ToolWindowId::Run, cx.new(|_| ListPanel::run()).into()),
-            (ToolWindowId::Problems, cx.new(|_| ListPanel::problems()).into()),
+            (ToolWindowId::Problems, problems.clone().into()),
             (ToolWindowId::Git, git_log.into()),
             (ToolWindowId::Services, cx.new(|_| ListPanel::services()).into()),
             (ToolWindowId::Harness, harness.into()),
@@ -171,16 +173,33 @@ impl Workspace {
                     }
                 });
             }
+            EditorAreaEvent::ShowToolWindow(id) if !this.is_open(*id) => this.show(*id, window, cx),
             _ => {}
+        }));
+        subs.push(cx.subscribe_in(&project_model, window, |this, _, ev: &ProjectModelEvent, window, cx| {
+            if let ProjectModelEvent::Fs(ev) = ev {
+                this.editor.update(cx, |e, cx| e.reload_from_disk(&ev.paths, window, cx));
+            }
         }));
         subs.push(cx.subscribe_in(&project, window, |this, _, ev: &ProjectEvent, window, cx| match ev {
             ProjectEvent::OpenFile(path) => this.open_file(path.clone(), window, cx),
         }));
         subs.push(cx.subscribe_in(&agents, window, |this, agents, ev: &AgentsEvent, window, cx| {
             match ev {
-                // Integration point: forward to `tandem_acp::Session::respond`.
-                AgentsEvent::Decide(_) => {}
                 AgentsEvent::Toast(msg) => toast(msg.clone(), window, cx),
+                AgentsEvent::Changed => {}
+                AgentsEvent::ReviewReady(task) => {
+                    // Refresh Review when it shows this task (or nothing yet); others get the new
+                    // diff for intent-conflict detection.
+                    let showing = this.review.read(cx).task().cloned();
+                    if showing.is_none() || showing.as_ref() == Some(task) {
+                        this.open_review(task, false, window, cx);
+                    } else {
+                        let others = agents.read(cx).review_inputs();
+                        this.review.update(cx, |r, cx| r.refresh_conflicts(others, cx));
+                    }
+                }
+                AgentsEvent::OpenReview(task) => this.open_review(task, true, window, cx),
             }
             let running = agents.read(cx).model.running_count();
             this.status.update(cx, |s, cx| {
@@ -189,11 +208,14 @@ impl Workspace {
             });
             cx.notify();
         }));
-        subs.push(cx.subscribe_in(&review, window, |_, _, ev: &ReviewEvent, window, cx| {
-            // Integration point: AcceptHunk / RejectHunk → `tandem_review::apply_hunk`.
-            if let ReviewEvent::Toast(msg) = ev {
-                toast(msg.clone(), window, cx);
+        subs.push(cx.subscribe_in(&review, window, |this, _, ev: &ReviewEvent, window, cx| match ev {
+            ReviewEvent::Toast(msg) => toast(msg.clone(), window, cx),
+            ReviewEvent::OpenFile { path, line } => this.open_file_at(path.clone(), *line, window, cx),
+            ReviewEvent::ShowTask(task) => {
+                this.agents.update(cx, |a, cx| a.select_task(task, cx));
+                this.open_review(task, true, window, cx);
             }
+            ReviewEvent::Applied { .. } => {}
         }));
         subs.push(cx.observe_window_bounds(window, |_, window, _| {
             let b = window.bounds();
@@ -207,7 +229,7 @@ impl Workspace {
             .save();
         }));
 
-        let mut this = Self {
+        Self {
             root: root.clone(),
             editor,
             project,
@@ -218,32 +240,15 @@ impl Workspace {
             tool_windows,
             layout,
             search: None,
-            files: Arc::new(vec![]),
-            indexing: true,
+            project_model,
+            terminal,
+            problems,
             branch,
             focus: cx.focus_handle(),
             last_shift: None,
             shift_down: false,
             _subs: subs,
-        };
-        this.start_indexing(cx);
-        this
-    }
-
-    fn start_indexing(&mut self, cx: &mut Context<Self>) {
-        let root = self.root.clone();
-        let task = cx.background_executor().spawn(async move { project::index_files(&root, FILE_INDEX_LIMIT) });
-        cx.spawn(async move |this, cx| {
-            let files = Arc::new(task.await);
-            let _ = this.update(cx, |this, cx| {
-                this.files = files.clone();
-                this.indexing = false;
-                if let Some(s) = &this.search {
-                    s.update(cx, |s, cx| s.set_files(files, cx));
-                }
-            });
-        })
-        .detach();
+        }
     }
 
     pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -295,6 +300,9 @@ impl Workspace {
         if id == ToolWindowId::Project {
             let f = self.project.read(cx).focus_handle(cx);
             window.focus(&f, cx);
+        } else if id == ToolWindowId::Terminal {
+            let f = self.terminal.read(cx).focus_handle(cx);
+            window.focus(&f, cx);
         } else {
             let f = tw.read(cx).focus_handle(cx);
             window.focus(&f, cx);
@@ -335,16 +343,9 @@ impl Workspace {
             });
             return;
         }
-        let recent: Vec<PathBuf> = self
-            .editor
-            .read(cx)
-            .recent
-            .iter()
-            .filter_map(|p| p.strip_prefix(&self.root).ok().map(Path::to_path_buf))
-            .collect();
-        let files = self.files.clone();
-        let indexing = self.indexing;
-        let popup = cx.new(|cx| SearchPopup::new(tab, files, indexing, recent, window, cx));
+        let current = self.editor.read(cx).active_path();
+        let model = self.project_model.clone();
+        let popup = cx.new(|cx| SearchPopup::new(tab, model, current, window, cx));
         let sub = cx.subscribe_in(&popup, window, |this, _, ev: &SearchEvent, window, cx| match ev {
             SearchEvent::OpenFile(path) => {
                 this.close_search(window, cx);
@@ -355,12 +356,40 @@ impl Workspace {
                 this.close_search(window, cx);
                 window.dispatch_action(action, cx);
             }
+            SearchEvent::OpenAt(path, line, col) => {
+                this.close_search(window, cx);
+                let path = if path.is_absolute() { path.clone() } else { this.root.join(path) };
+                let pos = tandem_lsp::lsp_types::Position::new(*line, *col);
+                this.editor.update(cx, |e, cx| e.open_at(path, pos, window, cx));
+            }
+            SearchEvent::OpenInFindWindow(q) => {
+                this.close_search(window, cx);
+                this.open_find_window(Some(q.clone()), window, cx);
+            }
             SearchEvent::Dismiss => this.close_search(window, cx),
         });
         self._subs.push(sub);
         popup.update(cx, |s, cx| s.focus(window, cx));
         self.search = Some(popup);
         cx.notify();
+    }
+
+    /// ⌘⇧F: Search Everywhere's Text tab, seeded with the editor selection.
+    pub fn find_in_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sel = self.editor.read(cx).selected_text(cx);
+        self.open_search(SearchTab::Text, window, cx);
+        if let (Some(sel), Some(s)) = (sel, self.search.clone()) {
+            s.update(cx, |s, cx| s.set_query(sel, window, cx));
+        }
+    }
+
+    /// The Find in Files results window (a tab of the bottom Problems tool window).
+    pub fn open_find_window(&mut self, query: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_open(ToolWindowId::Problems) {
+            self.show(ToolWindowId::Problems, window, cx);
+        }
+        let find = self.editor.read(cx).find.clone();
+        find.update(cx, |f, cx| f.search_for(query, window, cx));
     }
 
     pub fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -371,21 +400,34 @@ impl Workspace {
     }
 
     fn stop_all_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Integration point: `tandem_sandbox::kill_switch()` SIGTERMs every agent process group.
-        self.agents.update(cx, |a, cx| {
-            for t in &mut a.model.tasks {
-                if matches!(t.status, model::agents::TaskStatus::Running | model::agents::TaskStatus::NeedsApproval) {
-                    t.status = model::agents::TaskStatus::Failed;
-                }
-            }
-            cx.notify();
-        });
+        // Kill switch: SIGTERM every agent process group (tandem_acp::stop_all), SIGKILL after 2 s.
+        self.agents.update(cx, |a, cx| a.stop_all(cx));
         self.status.update(cx, |s, cx| {
             s.agents_running = 0;
             cx.notify();
         });
         window.push_notification(Notification::warning("Kill switch: every agent was stopped.").title("Stop All Agents"), cx);
         cx.notify();
+    }
+
+    /// Show a task's diff in the Review panel (with conflicts against every other task).
+    pub fn open_review(&mut self, task: &tandem_core::TaskId, show: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (input, others) = {
+            let a = self.agents.read(cx);
+            (a.review_input(task), a.review_inputs())
+        };
+        let Some(input) = input else { return };
+        self.review.update(cx, |r, cx| r.open_task(input, others, cx));
+        if show && !self.is_open(ToolWindowId::Review) {
+            self.show(ToolWindowId::Review, window, cx);
+        }
+    }
+
+    /// Open `path` and put the caret on 1-based `line`.
+    pub fn open_file_at(&mut self, path: PathBuf, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let path = if path.is_absolute() { path } else { self.root.join(path) };
+        let pos = gpui_kit::component::input::Position::new(line.saturating_sub(1), 0);
+        self.editor.update(cx, |e, cx| e.open_at(path, pos, window, cx));
     }
 
     fn on_modifiers(&mut self, ev: &ModifiersChangedEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -461,7 +503,7 @@ impl Render for Workspace {
             project: self.root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
             branch: self.branch.clone(),
             agents_running: agents.model.running_count(),
-            agents_waiting: agents.model.tasks.iter().filter(|t| t.status == model::agents::TaskStatus::NeedsApproval).count(),
+            agents_waiting: agents.model.waiting_count(),
         };
         let _ = window;
 
@@ -507,13 +549,54 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &GotoFile, window, cx| this.open_search(SearchTab::Files, window, cx)))
             .on_action(cx.listener(|this, _: &RecentFiles, window, cx| this.open_search(SearchTab::Files, window, cx)))
             .on_action(cx.listener(|this, _: &GotoAction, window, cx| this.open_search(SearchTab::Actions, window, cx)))
-            .on_action(cx.listener(|_, _: &GotoSymbol, window, cx| toast("Go to Symbol needs tandem-lsp (not wired yet)".into(), window, cx)))
-            .on_action(cx.listener(|_, _: &FindInFiles, window, cx| toast("Find in Files needs tandem-project search (not wired yet)".into(), window, cx)))
+            .on_action(cx.listener(|this, _: &GotoSymbol, window, cx| this.open_search(SearchTab::Symbols, window, cx)))
+            .on_action(cx.listener(|this, _: &FindInFiles, window, cx| this.find_in_files(window, cx)))
+            .on_action(cx.listener(|this, _: &crate::editor::actions::ShowBranches, window, cx| {
+                let me = cx.weak_entity();
+                let on_checkout = std::rc::Rc::new(move |branch: String, window: &mut Window, cx: &mut App| {
+                    let _ = me.update(cx, |this, cx| {
+                        this.branch = branch.clone();
+                        this.status.update(cx, |s, cx| {
+                            s.branch = branch;
+                            cx.notify();
+                        });
+                        let paths: Vec<PathBuf> = this.editor.read(cx).files.iter().map(|f| f.path.clone()).collect();
+                        this.editor.update(cx, |e, cx| e.reload_from_disk(&paths, window, cx));
+                        cx.notify();
+                    });
+                });
+                crate::panels::git::branches_dialog(this.root.clone(), on_checkout, window, cx);
+            }))
             .on_action(cx.listener(|_, _: &Find, window, cx| toast("Find: use ⌘F inside the editor".into(), window, cx)))
             .on_action(cx.listener(|this, _: &HideToolWindows, window, cx| this.hide_all(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| settings::open(this.root.clone(), window, cx)))
             .on_action(cx.listener(|_, _: &ToggleTheme, _, cx| settings::toggle_theme(cx)))
             .on_action(cx.listener(|this, _: &StopAllAgents, window, cx| this.stop_all_agents(window, cx)))
+            .on_action(cx.listener(|this, a: &crate::tasks::actions::OpenTerminalWith, window, cx| {
+                let req = crate::tasks::terminal::TerminalRequest {
+                    title: a.title.clone(),
+                    program: a.program.clone(),
+                    args: a.args.clone(),
+                    cwd: a.cwd.clone().or_else(|| Some(this.root.clone())),
+                };
+                match crate::tasks::terminal::open_terminal_with(req) {
+                    Ok(()) => {
+                        this.show(ToolWindowId::Terminal, window, cx);
+                        toast(format!("{}: finish signing in in the Terminal tab", a.title).into(), window, cx);
+                    }
+                    Err(e) => toast(format!("Cannot start {}: {e}", a.program).into(), window, cx),
+                }
+            }))
+            .on_action(cx.listener(|this, a: &crate::tasks::actions::ShowAgentBlame, window, cx| {
+                match crate::tasks::blame::lookup(&this.root, &a.path, a.line) {
+                    Some(e) => {
+                        let agent = model::agents::agent_badge(&e.agent).2;
+                        toast(format!("Line {}: {agent} · task {} · “{}”", a.line, e.task, e.prompt_excerpt).into(), window, cx);
+                        this.agents.update(cx, |ag, cx| ag.select_task(&e.task, cx));
+                    }
+                    None => toast(format!("Line {}: no agent wrote this line", a.line).into(), window, cx),
+                }
+            }))
             .on_action(cx.listener(|this, _: &SelectInProjectView, window, cx| {
                 if let Some(path) = this.editor.read(cx).active_path() {
                     this.project.update(cx, |p, cx| p.reveal(&path, cx));
@@ -528,7 +611,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|_, _: &DebugConfiguration, window, cx| toast("Debugger (DAP) is a phase 2 feature".into(), window, cx)))
             .on_action(cx.listener(|_, _: &StopRun, window, cx| toast("Nothing is running".into(), window, cx)))
-            .on_action(cx.listener(|_, a: &NotImplemented, window, cx| toast(format!("{}: not implemented yet", a.0).into(), window, cx)))
+            .on_action(cx.listener(|_, a: &NotImplemented, window, cx| {
+                if a.0 == "Git Branches" {
+                    return window.dispatch_action(Box::new(crate::editor::actions::ShowBranches), cx);
+                }
+                toast(format!("{}: not implemented yet", a.0).into(), window, cx)
+            }))
             .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()));
 
         let search_overlay = self.search.clone().map(|s| {

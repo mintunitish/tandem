@@ -8088,13 +8088,28 @@ name = "tandem-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "chrono",
  "dirs 6.0.0",
+ "futures",
  "gpui-kit",
  "ignore",
+ "parking_lot",
  "serde",
  "serde_json",
+ "tandem-acp",
  "tandem-core",
+ "tandem-db",
+ "tandem-git",
+ "tandem-harness",
+ "tandem-lsp",
+ "tandem-project",
+ "tandem-quota",
+ "tandem-review",
+ "tandem-sandbox",
+ "tandem-skills",
+ "tandem-terminal",
+ "tokio",
 ]
 
 [[package]]
@@ -8164,6 +8179,7 @@ dependencies = [
  "serde_yaml",
  "tandem-acp",
  "tandem-core",
+ "tandem-sandbox",
  "tempfile",
  "tokio",
  "tracing",

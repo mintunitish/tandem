@@ -23,6 +23,21 @@ chrono.workspace = true
 dirs.workspace = true
 ignore.workspace = true
 gpui-kit.workspace = true
+tokio.workspace = true
+async-channel.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+tandem-acp.workspace = true
+tandem-quota.workspace = true
+tandem-sandbox.workspace = true
+tandem-git.workspace = true
+tandem-review.workspace = true
+tandem-skills.workspace = true
+tandem-db.workspace = true
+tandem-harness.workspace = true
+tandem-terminal.workspace = true
+tandem-project.workspace = true
+tandem-lsp.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
