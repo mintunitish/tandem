@@ -251,17 +251,18 @@ pub fn detect_agents(root: &Path) -> Vec<DetectedAgent> {
     v
 }
 
-/// The vendor login command for "Sign in" (opens in a Terminal tab): the built-in
-/// descriptor's `login_command`, else the command quoted in `auth_note`.
-pub fn login_command(agent: &AgentId, auth_note: &str) -> Option<(String, Vec<String>)> {
-    if let Some(mut cmd) = tandem_acp::get(agent.as_str()).and_then(|d| d.login_command)
-        && !cmd.is_empty()
-    {
-        let program = cmd.remove(0);
-        return Some((program, cmd));
+/// The vendor login command for "Sign in" (opens in a Terminal tab). Claude Code signs in with
+/// its `/login` slash command; other agents use the descriptor's `login_command`, else the
+/// command quoted in `auth_note`.
+pub fn login_command(desc: &AgentDescriptor) -> Option<(String, Vec<String>)> {
+    if desc.id.as_str() == "claude" {
+        return Some(("claude".into(), vec!["/login".into()]));
+    }
+    if let Some((program, args)) = desc.login_command.as_ref().and_then(|c| c.split_first()) {
+        return Some((program.clone(), args.to_vec()));
     }
     // auth notes look like "Kiro login (`kiro-cli login`)".
-    let cmd = auth_note.split('`').nth(1)?;
+    let cmd = desc.auth_note.split('`').nth(1)?;
     let mut parts = cmd.split_whitespace();
     Some((parts.next()?.to_string(), parts.map(String::from).collect()))
 }
@@ -302,6 +303,7 @@ mod tests {
     fn ids_are_worktree_safe() {
         let id = new_task_id(&"claude".into());
         assert!(id.as_str().starts_with("claude-") && id.as_str().len() == 15);
-        assert!(login_command(&"kiro".into(), "Kiro login (`kiro-cli login`)").is_some_and(|(p, a)| p == "kiro-cli" && a == ["login"]));
+        let kiro = AgentDescriptor { id: "kiro".into(), auth_note: "Kiro login (`kiro-cli login`)".into(), ..Default::default() };
+        assert!(login_command(&kiro).is_some_and(|(p, a)| p == "kiro-cli" && a == ["login"]));
     }
 }

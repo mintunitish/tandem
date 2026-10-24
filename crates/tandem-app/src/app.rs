@@ -60,6 +60,7 @@ pub fn init(theme_override: Option<ThemeKind>, cx: &mut App) {
     }
     theme::apply(settings.theme, settings.editor_font_size, cx);
     cx.set_global(settings);
+    cx.set_global(crate::tasks::quota::QuotaMode::from_env());
     keymap::bind_keys(cx);
     crate::editor::actions::bind_keys(cx);
     cx.on_action(|_: &Quit, cx| cx.quit());

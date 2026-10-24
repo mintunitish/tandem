@@ -14,10 +14,14 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 use tandem_project::{CancelToken, FileIndex, SymbolIndex, find_in_files};
 
 pub const MAX_RESULTS: usize = 60;
 const MAX_TEXT_RESULTS: usize = 200;
+/// Typing re-ranks this long after the last keystroke.
+const RANK_DEBOUNCE: Duration = Duration::from_millis(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchTab {
@@ -67,10 +71,16 @@ pub struct SearchPopup {
     model: Entity<ProjectModel>,
     root: PathBuf,
     /// Recent files (relative, most recent first, current file excluded).
-    recent: Vec<PathBuf>,
-    pub results: Vec<SearchItem>,
+    recent: Arc<[PathBuf]>,
+    /// What the list shows; shared with the list renderer (no per-frame copies).
+    pub results: Arc<Vec<SearchItem>>,
     pub selected: usize,
-    text_results: Vec<SearchItem>,
+    /// Bumped per query change; a background rank only lands if it is still current.
+    rank_gen: u64,
+    /// Generation of `results` (lags `rank_gen` while a rank is pending).
+    shown_gen: u64,
+    rank_task: Task<()>,
+    text_results: Arc<Vec<SearchItem>>,
     text_query: String,
     text_searching: bool,
     text_cancel: CancelToken,
@@ -95,13 +105,13 @@ impl SearchPopup {
     pub fn new(tab: SearchTab, model: Entity<ProjectModel>, current: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Type / to see commands"));
         let root = model.read(cx).root.clone();
-        let recent: Vec<PathBuf> =
-            model.read(cx).recent_files().into_iter().filter(|p| Some(p) != current.as_ref()).map(|p| rel(&root, &p)).collect();
+        let recent: Arc<[PathBuf]> =
+            model.read(cx).recent_files().iter().filter(|p| Some(*p) != current.as_ref()).map(|p| rel(&root, p)).collect();
         let subs = vec![
             cx.subscribe(&query, |this: &mut Self, _, ev: &InputEvent, cx| match ev {
                 InputEvent::Change => {
                     this.selected = 0;
-                    this.refresh(cx);
+                    this.refresh_debounced(cx);
                 }
                 InputEvent::PressEnter { secondary, .. } => {
                     if *secondary && this.tab == SearchTab::Text {
@@ -114,7 +124,7 @@ impl SearchPopup {
             }),
             cx.subscribe(&model, |this: &mut Self, _, ev: &ProjectModelEvent, cx| {
                 if matches!(ev, ProjectModelEvent::Indexed) {
-                    this.refresh(cx);
+                    this.refresh_debounced(cx);
                 }
             }),
         ];
@@ -124,9 +134,12 @@ impl SearchPopup {
             model,
             root,
             recent,
-            results: vec![],
+            results: Arc::default(),
             selected: 0,
-            text_results: vec![],
+            rank_gen: 0,
+            shown_gen: 0,
+            rank_task: Task::ready(()),
+            text_results: Arc::default(),
             text_query: String::new(),
             text_searching: false,
             text_cancel: CancelToken::new(),
@@ -167,19 +180,48 @@ impl SearchPopup {
         }
     }
 
+    /// Re-rank now (opening, switching tabs, confirming).
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.rank_gen += 1;
+        self.rank_task = Task::ready(());
         let q = self.query_text(cx);
         if self.tab == SearchTab::Text {
             self.start_text_search(&q, cx);
             self.results = self.text_results.clone();
         } else {
             let m = self.model.read(cx);
-            let files = m.files.read();
-            let symbols = m.symbols.read();
-            self.results = rank(&q, self.tab, &files, &symbols, &self.recent);
+            let items = rank(&q, self.tab, &m.files.read(), &m.symbols.read(), &self.recent);
+            self.results = Arc::new(items);
         }
+        self.shown_gen = self.rank_gen;
         self.selected = self.selected.min(self.results.len().saturating_sub(1));
         cx.notify();
+    }
+
+    /// Re-rank on the background executor `RANK_DEBOUNCE` after the last call; a newer call
+    /// cancels the pending one.
+    fn refresh_debounced(&mut self, cx: &mut Context<Self>) {
+        if self.tab == SearchTab::Text {
+            return self.refresh(cx);
+        }
+        self.rank_gen += 1;
+        let (generation, q, tab, recent) = (self.rank_gen, self.query_text(cx), self.tab, self.recent.clone());
+        let (files, symbols) = {
+            let m = self.model.read(cx);
+            (m.files.clone(), m.symbols.clone())
+        };
+        self.rank_task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RANK_DEBOUNCE).await;
+            let items = cx.background_spawn(async move { rank(&q, tab, &files.read(), &symbols.read(), &recent) }).await;
+            let _ = this.update(cx, |s, cx| {
+                if s.rank_gen == generation {
+                    s.results = Arc::new(items);
+                    s.shown_gen = generation;
+                    s.selected = s.selected.min(s.results.len().saturating_sub(1));
+                    cx.notify();
+                }
+            });
+        });
     }
 
     fn start_text_search(&mut self, q: &str, cx: &mut Context<Self>) {
@@ -189,7 +231,7 @@ impl SearchPopup {
         self.text_cancel.cancel();
         self.text_cancel = CancelToken::new();
         self.text_query = q.to_string();
-        self.text_results.clear();
+        self.text_results = Arc::default();
         if q.chars().count() < 2 {
             self.text_searching = false;
             self.text_task = Task::ready(());
@@ -210,7 +252,11 @@ impl SearchPopup {
                     .map(|m| SearchItem::Text { path: rel(&root, &m.path), line: m.line_no.saturating_sub(1) as u32, col: m.col as u32, text: m.line_text, ranges: m.ranges })
                     .collect();
                 let alive = this.update(cx, |s, cx| {
-                    s.text_results.extend(items);
+                    if s.tab == SearchTab::Text {
+                        // Drop the shared copy first so the append does not clone the list.
+                        s.results = Arc::default();
+                    }
+                    Arc::make_mut(&mut s.text_results).extend(items);
                     if s.tab == SearchTab::Text {
                         s.results = s.text_results.clone();
                     }
@@ -238,6 +284,10 @@ impl SearchPopup {
     }
 
     pub fn confirm(&mut self, cx: &mut Context<Self>) {
+        if self.shown_gen != self.rank_gen {
+            // Enter typed faster than the debounce: rank the current query first.
+            self.refresh(cx);
+        }
         match self.results.get(self.selected).cloned() {
             Some(SearchItem::File { path, .. }) => cx.emit(SearchEvent::OpenFile(path)),
             Some(SearchItem::Symbol { path, line, col, .. }) | Some(SearchItem::Text { path, line, col, .. }) => cx.emit(SearchEvent::OpenAt(path, line, col)),
@@ -280,9 +330,9 @@ pub fn rank(q: &str, tab: SearchTab, files: &FileIndex, symbols: &SymbolIndex, r
     };
     let action_items = |limit: usize| -> Vec<SearchItem> {
         let mut scored: Vec<(i64, SearchItem)> = keymap::entries()
-            .into_iter()
+            .iter()
             .filter_map(|e| {
-                let score = if q.is_empty() { Some(0) } else { crate::model::fuzzy::score(q, e.name).map(|(s, _)| s) };
+                let score = tandem_project::score(q, e.name);
                 score.map(|s| (s, SearchItem::Action { name: e.name, keys: e.keys, action: e.action }))
             })
             .collect();

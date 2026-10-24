@@ -1,8 +1,8 @@
-//! New UI main toolbar: traffic lights inset, project ▾, branch ▾, run widget, search, settings,
-//! agent status pill. Rendered inside gpui-kit's `TitleBar` (which owns window dragging).
+//! New UI main toolbar: traffic lights inset, project ▾, branch ▾, search, settings, agent
+//! status pill. Rendered inside gpui-kit's `TitleBar` (which owns window dragging).
 
 use crate::assets::icon;
-use crate::keymap::{DebugConfiguration, NotImplemented, OpenSettings, RunConfiguration, SearchEverywhere, StopRun, ToggleAgents};
+use crate::keymap::{NotImplemented, OpenSettings, SearchEverywhere, ToggleAgents};
 use crate::theme::{Palette, hex};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::TitleBar;
@@ -89,21 +89,6 @@ pub fn render(info: &TitleInfo, p: &Palette) -> impl IntoElement {
                 .on_click(|_, w, cx| w.dispatch_action(Box::new(NotImplemented("Git Branches".into())), cx)),
         );
 
-    let run = div()
-        .flex()
-        .items_center()
-        .gap(px(2.))
-        .child(
-            widget("tb-runconfig", p)
-                .child(icon(IconName::Play, 14., p.ok))
-                .child(div().text_color(fg).child("dev"))
-                .child(icon(IconName::ChevronDown, 12., p.muted))
-                .on_click(|_, w, cx| w.dispatch_action(Box::new(NotImplemented("Edit Configurations".into())), cx)),
-        )
-        .child(icon_btn("tb-run", IconName::Play, p.ok, p).on_click(|_, w, cx| w.dispatch_action(Box::new(RunConfiguration), cx)))
-        .child(icon_btn("tb-debug", IconName::Bug, p.ok, p).on_click(|_, w, cx| w.dispatch_action(Box::new(DebugConfiguration), cx)))
-        .child(icon_btn("tb-stop", IconName::Square, p.muted, p).on_click(|_, w, cx| w.dispatch_action(Box::new(StopRun), cx)));
-
     let waiting = info.agents_waiting > 0;
     let pill_color = if waiting { p.error } else if info.agents_running > 0 { p.ok } else { p.muted };
     let agents = |n: usize| if n == 1 { "1 agent".to_string() } else { format!("{n} agents") };
@@ -144,7 +129,6 @@ pub fn render(info: &TitleInfo, p: &Palette) -> impl IntoElement {
         .border_color(p.border)
         .child(
             div()
-                .relative()
                 .w_full()
                 .h_full()
                 .flex()
@@ -153,7 +137,6 @@ pub fn render(info: &TitleInfo, p: &Palette) -> impl IntoElement {
                 .pr(px(8.))
                 .text_size(px(13.))
                 .child(left)
-                .child(right)
-                .child(div().absolute().top_0().bottom_0().left(relative(0.5)).ml(px(-110.)).flex().items_center().child(run)),
+                .child(right),
         )
 }

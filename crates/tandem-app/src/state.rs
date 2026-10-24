@@ -1,6 +1,6 @@
 //! Persisted app state under `~/.tandem/`: settings, window bounds, tool-window layout.
 
-use crate::stripes::ToolWindowId;
+use crate::stripes::{Side, ToolWindowId};
 use crate::theme::ThemeKind;
 use gpui_kit::Global;
 use serde::{Deserialize, Serialize};
@@ -64,33 +64,29 @@ impl WindowGeometry {
     }
 }
 
-/// Which tool window each side shows, whether it is open, and its size.
+/// What one side dock shows, whether it is open, and its size.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SideLayout {
+    pub id: ToolWindowId,
+    pub open: bool,
+    pub size: f32,
+}
+
+/// Tool-window layout, one entry per [`Side`] (indexed by `Side::index`).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct LayoutState {
-    pub left: ToolWindowId,
-    pub right: ToolWindowId,
-    pub bottom: ToolWindowId,
-    pub left_open: bool,
-    pub right_open: bool,
-    pub bottom_open: bool,
-    pub left_size: f32,
-    pub right_size: f32,
-    pub bottom_size: f32,
+    pub sides: [SideLayout; 3],
 }
 
 impl Default for LayoutState {
     fn default() -> Self {
         Self {
-            left: ToolWindowId::Project,
-            right: ToolWindowId::Agents,
-            bottom: ToolWindowId::Terminal,
-            left_open: true,
-            right_open: false,
-            bottom_open: false,
-            left_size: 280.0,
-            right_size: 520.0,
-            bottom_size: 260.0,
+            sides: [
+                SideLayout { id: ToolWindowId::Project, open: true, size: 280.0 },
+                SideLayout { id: ToolWindowId::Agents, open: false, size: 520.0 },
+                SideLayout { id: ToolWindowId::Terminal, open: false, size: 260.0 },
+            ],
         }
     }
 }
@@ -101,6 +97,12 @@ impl LayoutState {
     }
     pub fn save(&self) {
         write_json(&tandem_home().join("layout.json"), self);
+    }
+    pub fn side(&self, side: Side) -> &SideLayout {
+        &self.sides[side.index()]
+    }
+    pub fn side_mut(&mut self, side: Side) -> &mut SideLayout {
+        &mut self.sides[side.index()]
     }
 }
 

@@ -1,5 +1,6 @@
 //! Editor ↔ `tandem-lsp`: one `LspHub` per window owns the `LspManager`, keeps open documents in
-//! sync (debounced full-text `didChange`), collects diagnostics and progress, and hands out the
+//! sync (debounced full-text `didChange`: keystrokes only hand over a rope snapshot, the text is
+//! built and hashed when the debounce fires), collects diagnostics and progress, and hands out the
 //! gpui-kit provider objects (`CompletionProvider`, `HoverProvider`, `DefinitionProvider`,
 //! `CodeActionProvider`) that the editor calls.
 //!
@@ -18,17 +19,25 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tandem_lsp::lsp_types::{self as lsp, CodeAction, CodeActionOrCommand, CompletionContext, CompletionItem, CompletionResponse, CompletionTextEdit, InsertTextFormat};
 use tandem_lsp::{ChangeDebouncer, ClientKey, LspClient, LspError, LspManager, ManagerEvent, ServerNotification};
 
 /// Completion items shown at most.
 const MAX_COMPLETIONS: usize = 150;
+/// `didChange` is sent this long after the last edit...
+const CHANGE_DEBOUNCE: Duration = Duration::from_millis(50);
+/// ...or this long after the first edit of a continuous burst.
+const CHANGE_MAX_WAIT: Duration = Duration::from_millis(500);
 
 struct Doc {
     client: Arc<LspClient>,
     debouncer: ChangeDebouncer,
     version: i32,
     text_hash: u64,
+    /// Latest unsynced buffer snapshot (cheap rope clone) and when the burst started.
+    pending: Option<(Rope, Instant)>,
+    flush: Task<()>,
 }
 
 pub enum LspHubEvent {
@@ -181,18 +190,41 @@ impl LspHub {
     fn attach(&mut self, path: PathBuf, client: Arc<LspClient>, language_id: &str, text: String) {
         let _rt = runtime::tokio().enter();
         let key = ClientKey { root: client.root().to_path_buf(), server_id: client.config().id.clone() };
-        let debouncer = self.debouncers.entry(key).or_insert_with(|| ChangeDebouncer::new((*client).clone())).clone();
+        // The hub debounces (see `change`); the shared debouncer only serializes and flushes.
+        let debouncer =
+            self.debouncers.entry(key).or_insert_with(|| ChangeDebouncer::with_delay((*client).clone(), Duration::ZERO, Duration::ZERO)).clone();
         let _ = client.did_open(&path, language_id, &text);
-        self.docs.insert(path, Doc { client, debouncer, version: 0, text_hash: hash_text(&text) });
+        self.docs.insert(path, Doc { client, debouncer, version: 0, text_hash: hash_text(&text), pending: None, flush: Task::ready(()) });
     }
 
     pub fn is_open(&self, path: &Path) -> bool {
         self.docs.contains_key(path)
     }
 
-    /// Queue a full-text `didChange` (debounced). No-op when the text did not change.
-    pub fn change(&mut self, path: &Path, text: &str) {
+    /// Record an edit: keeps the snapshot and (re)arms the debounce timer.
+    pub fn change(&mut self, path: &Path, text: Rope, cx: &mut Context<Self>) {
         let Some(doc) = self.docs.get_mut(path) else { return };
+        let since = doc.pending.as_ref().map_or_else(Instant::now, |p| p.1);
+        doc.pending = Some((text, since));
+        let delay = CHANGE_DEBOUNCE.min(CHANGE_MAX_WAIT.saturating_sub(since.elapsed()));
+        let p = path.to_path_buf();
+        doc.flush = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |hub, _| hub.flush_pending(&p));
+        });
+    }
+
+    /// Send the pending snapshot now (if any).
+    fn flush_pending(&mut self, path: &Path) {
+        let Some((rope, _)) = self.docs.get_mut(path).and_then(|d| d.pending.take()) else { return };
+        self.sync_text(path, &rope.to_string());
+    }
+
+    /// Queue a full-text `didChange` of `text`. No-op when the text did not change.
+    fn sync_text(&mut self, path: &Path, text: &str) {
+        let Some(doc) = self.docs.get_mut(path) else { return };
+        doc.pending = None;
+        doc.flush = Task::ready(());
         let h = hash_text(text);
         if h == doc.text_hash {
             return;
@@ -204,6 +236,7 @@ impl LspHub {
 
     /// Flush pending changes, then `didSave`.
     pub fn save(&mut self, path: &Path) {
+        self.flush_pending(path);
         let Some(doc) = self.docs.get(path) else { return };
         let (client, deb, p) = (doc.client.clone(), doc.debouncer.clone(), path.to_path_buf());
         runtime::tokio().spawn(async move {
@@ -213,6 +246,7 @@ impl LspHub {
     }
 
     pub fn close(&mut self, path: &Path) {
+        self.flush_pending(path);
         if let Some(doc) = self.docs.remove(path) {
             let p = path.to_path_buf();
             runtime::tokio().spawn(async move {
@@ -234,8 +268,9 @@ impl LspHub {
         F: FnOnce(Arc<LspClient>, PathBuf) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
     {
-        if let Some(text) = text {
-            self.change(path, text);
+        match text {
+            Some(text) => self.sync_text(path, text),
+            None => self.flush_pending(path),
         }
         let doc = self.docs.get(path)?;
         let (client, deb, p) = (doc.client.clone(), doc.debouncer.clone(), path.to_path_buf());

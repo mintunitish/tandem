@@ -134,7 +134,7 @@ impl Render for SettingsView {
                 .id("settings-keymap")
                 .h(px(380.))
                 .overflow_y_scroll()
-                .child(v_flex().children(keymap::entries().into_iter().map(|e| {
+                .child(v_flex().children(keymap::entries().iter().map(|e| {
                     h_flex()
                         .h(px(26.))
                         .px(px(6.))

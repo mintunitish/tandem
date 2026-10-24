@@ -4,8 +4,8 @@
 //! worktree with Agent Blame, and intent-conflict banners across every open task.
 
 use crate::assets::{file_icon, icon};
-use crate::model::agents::agent_badge;
-use crate::model::review::{line_counts, to_unified_patch};
+use crate::model::agents::Badge;
+use crate::model::review::line_counts;
 use crate::panels::agents::avatar;
 use crate::panels::chip;
 use crate::theme::{Palette, pal};
@@ -45,6 +45,8 @@ struct Current {
     conflicts: Vec<IntentConflict>,
     /// Symbols touched per hunk of the selected file.
     symbols: Vec<Vec<SymbolRef>>,
+    /// (+added, −removed) lines per file.
+    line_counts: Vec<(usize, usize)>,
 }
 
 pub struct ReviewPanel {
@@ -82,7 +84,8 @@ impl ReviewPanel {
         let conflicts = tandem_review::detect(&all).into_iter().filter(|c| c.a.task == me || c.b.task == me).collect();
         let summary = tandem_review::describe(&input.diff);
         let keep = self.task() == Some(&me);
-        self.current = Some(Current { input, state, summary, conflicts, symbols: vec![] });
+        let line_counts = input.diff.files.iter().map(line_counts).collect();
+        self.current = Some(Current { input, state, summary, conflicts, symbols: vec![], line_counts });
         let sel = if keep { self.selected } else { 0 };
         self.select(sel, cx);
     }
@@ -191,11 +194,6 @@ impl ReviewPanel {
         cx.notify();
     }
 
-    /// Agent Blame entry for a main-tree line (see also `crate::tasks::blame::lookup`).
-    pub fn blame_at(&self, path: &std::path::Path, line: u32) -> Option<tandem_core::BlameEntry> {
-        crate::tasks::blame::lookup(&self.root, path, line)
-    }
-
     fn file_row(&self, c: &Current, ix: usize, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let f = &c.input.diff.files[ix];
         let name = f.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -206,7 +204,7 @@ impl ReviewPanel {
             FileChange::Deleted => p.git_deleted,
             _ => p.git_modified,
         };
-        let (adds, dels) = line_counts(f);
+        let (adds, dels) = c.line_counts[ix];
         let selected = ix == self.selected;
         let shown = f.path.display().to_string();
         let risky = c.summary.risky.iter().any(|r| r.contains(&shown));
@@ -235,7 +233,7 @@ impl ReviewPanel {
 
     fn conflict_banner(&self, i: usize, c: &IntentConflict, me: &TaskId, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let (mine, other) = if &c.a.task == me { (&c.a, &c.b) } else { (&c.b, &c.a) };
-        let other_name = agent_badge(&other.agent).2;
+        let other_name = Badge::for_agent(&other.agent).name;
         let other_task = other.task.clone();
         h_flex()
             .flex_none()
@@ -273,7 +271,7 @@ impl ReviewPanel {
 fn parse(ds: &DiffSet, ix: usize) -> Vec<DiffFile> {
     ds.files
         .get(ix)
-        .and_then(|f| DiffFile::parse(&to_unified_patch(f)).ok())
+        .and_then(|f| DiffFile::parse(&f.to_patch()).ok())
         .unwrap_or_default()
         .into_iter()
         .map(|f| {
@@ -298,15 +296,15 @@ impl Render for ReviewPanel {
                 .child(div().text_size(px(12.)).child("When an agent task finishes, its worktree diff shows up here."))
                 .into_any_element();
         };
-        let (letter, color, agent_name) = agent_badge(&c.input.meta.agent);
+        let badge = Badge::for_agent(&c.input.meta.agent);
         let me = c.input.meta.task.clone();
         let files: Vec<AnyElement> = (0..c.input.diff.files.len()).map(|i| self.file_row(&c, i, &p, cx).into_any_element()).collect();
         let banners: Vec<AnyElement> = c.conflicts.iter().enumerate().map(|(i, k)| self.conflict_banner(i, k, &me, &p, cx).into_any_element()).collect();
         let counts = c.state.counts();
         let sel = self.selected;
-        let file = c.input.diff.files.get(sel).cloned();
+        let file = c.input.diff.files.get(sel);
         let mut hunk_bar: Vec<AnyElement> = Vec::new();
-        if let Some(f) = &file {
+        if let Some(f) = file {
             let rel = f.path.clone();
             let slots = f.hunks.len().max(1);
             for h in 0..slots {
@@ -369,9 +367,10 @@ impl Render for ReviewPanel {
                     .gap(px(8.))
                     .border_b_1()
                     .border_color(p.border)
-                    .child(avatar(letter, color, 18.))
+                    .child(avatar(badge.letters, badge.color, 18.))
                     .child(div().flex_1().min_w_0().text_color(p.text).font_weight(FontWeight::MEDIUM).whitespace_nowrap().overflow_hidden().text_ellipsis().child(format!(
-                        "{agent_name} · {}",
+                        "{} · {}",
+                        badge.name,
                         c.input.meta.intent_line()
                     )))
                     .child(div().flex_none().text_size(px(12.)).text_color(p.muted).child(format!(
@@ -426,7 +425,7 @@ impl Render for ReviewPanel {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .when_some(file.clone(), |d, f| {
+                            .when_some(file, |d, f| {
                                 let path = root.join(&f.path);
                                 d.child(
                                     h_flex()

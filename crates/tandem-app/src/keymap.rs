@@ -43,9 +43,6 @@ actions!(
         StopAllAgents,
         ToggleTheme,
         SelectInProjectView,
-        RunConfiguration,
-        DebugConfiguration,
-        StopRun,
         Quit,
     ]
 );
@@ -69,8 +66,10 @@ pub struct KeymapEntry {
 
 macro_rules! entries {
     ($( $name:literal, $keys:literal, $action:expr; )*) => {
-        pub fn entries() -> Vec<KeymapEntry> {
-            vec![$( KeymapEntry { name: $name, keys: $keys, action: || Box::new($action) } ),*]
+        /// The keymap table, built once.
+        pub fn entries() -> &'static [KeymapEntry] {
+            static ENTRIES: std::sync::OnceLock<Vec<KeymapEntry>> = std::sync::OnceLock::new();
+            ENTRIES.get_or_init(|| vec![$( KeymapEntry { name: $name, keys: $keys, action: || Box::new($action) } ),*])
         }
     };
 }
@@ -112,9 +111,6 @@ entries! {
     "Stop All Agents", "cmd-alt-shift-k", StopAllAgents;
     "Toggle Light/Dark Theme", "", ToggleTheme;
     "Select in Project View", "alt-f1", SelectInProjectView;
-    "Run", "ctrl-r", RunConfiguration;
-    "Debug", "ctrl-d", DebugConfiguration;
-    "Stop", "cmd-f2", StopRun;
     "Quit Tandem", "cmd-q", Quit;
 }
 

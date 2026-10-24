@@ -59,7 +59,7 @@ impl Render for StatusBarView {
         });
         let project = ed.root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let has_file = cursor.is_some();
-        let (eol, indent) = ed.active_file().map(|f| detect_format(f.state.read(cx).text())).unwrap_or(("LF", "4 spaces".into()));
+        let (eol, indent) = ed.active_file().map(|f| f.format(cx)).unwrap_or(("LF", "4 spaces".into()));
         let hub = ed.lsp.read(cx);
         let lsp_text = hub.status_text();
         let hint = hub.missing.clone();
@@ -118,7 +118,7 @@ impl Render for StatusBarView {
 }
 
 /// `(line separator, indent)` sniffed from the first lines of the buffer.
-pub fn detect_format(text: &gpui_kit::component::input::Rope) -> (&'static str, String) {
+pub fn detect_format(text: &gpui_kit::component::input::Rope) -> (&'static str, SharedString) {
     use gpui_kit::component::input::RopeExt as _;
     let mut eol = "LF";
     let mut tabs = 0;
@@ -138,10 +138,10 @@ pub fn detect_format(text: &gpui_kit::component::input::Rope) -> (&'static str, 
         }
     }
     let indent = if tabs > widths.len() {
-        "Tab".to_string()
+        "Tab".into()
     } else {
         let unit = widths.iter().copied().filter(|w| *w <= 8).min().unwrap_or(4);
-        format!("{} spaces", if unit == 2 || unit == 4 || unit == 8 { unit } else { 4 })
+        format!("{} spaces", if unit == 2 || unit == 4 || unit == 8 { unit } else { 4 }).into()
     };
     (eol, indent)
 }

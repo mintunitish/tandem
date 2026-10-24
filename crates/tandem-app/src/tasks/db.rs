@@ -2,9 +2,11 @@
 //! `tandem-db-mcp` MCP server. Stored per project in `.tandem/db-agents.json`.
 //!
 //! Default is read-only (`tandem-db-mcp --connection X`); `--allow-write` only when the user
-//! toggled it in the Database panel (a Review-class action with its own confirmation). The tool
-//! definitions are hash-pinned in `.tandem/mcp-pins.json` at first exposure; a changed server is
-//! not attached until re-approved.
+//! toggled it in the Database panel (a Review-class action with its own confirmation). With
+//! `allow_dangerous`, destructive statements are possible too, each only once its `sql_hash` is
+//! listed in `.tandem/db-confirm.json`, which the panel's red confirm dialog appends to
+//! (`--allow-dangerous --confirm-file`). The tool definitions are hash-pinned in
+//! `.tandem/mcp-pins.json` at first exposure; a changed server is not attached until re-approved.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -17,6 +19,9 @@ use tandem_sandbox::{PinStatus, PinStore};
 pub struct Exposure {
     #[serde(default)]
     pub allow_write: bool,
+    /// Destructive SQL, per statement approved in the IDE (see [`confirm_file`]).
+    #[serde(default)]
+    pub allow_dangerous: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +35,23 @@ fn path(root: &Path) -> PathBuf {
 }
 
 pub use tandem_db::server_name;
+
+/// `.tandem/db-confirm.json`: JSON array of approved statement hashes (`tandem_db::sql_hash`).
+/// Agents cannot write it: `.tandem/` is read-only in their sandbox.
+pub fn confirm_file(root: &Path) -> PathBuf {
+    root.join(".tandem").join("db-confirm.json")
+}
+
+/// Record the user's approval of one destructive statement for agents' MCP servers.
+pub fn approve_statement(root: &Path, sql: &str) -> std::io::Result<()> {
+    let path = confirm_file(root);
+    let mut set: std::collections::BTreeSet<String> =
+        std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    if set.insert(tandem_db::sql_hash(sql)) {
+        tandem_core::fs::atomic_write(&path, serde_json::to_string_pretty(&set).unwrap_or_default().as_bytes())?;
+    }
+    Ok(())
+}
 
 /// Policy for statements the user runs in the Database panel: everything allowed, dangerous
 /// statements only after the panel's red-card dialog. `confirmed` is that dialog's answer
@@ -87,7 +109,11 @@ pub fn mcp_specs(root: &Path) -> (Vec<McpServerSpec>, Vec<String>) {
             continue;
         }
         notes.push(format!("database `{name}` attached via MCP ({})", if exp.allow_write { "read + write" } else { "read-only" }));
-        specs.push(tandem_db::server_spec(&name, exp.allow_write, false));
+        let mut spec = tandem_db::server_spec(&name, exp.allow_write, false);
+        if exp.allow_dangerous {
+            spec.args.extend(["--allow-dangerous".to_string(), "--confirm-file".to_string(), confirm_file(root).to_string_lossy().into_owned()]);
+        }
+        specs.push(spec);
     }
     (specs, notes)
 }

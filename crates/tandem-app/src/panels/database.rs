@@ -324,7 +324,12 @@ impl DatabasePanel {
                 Button::new("db-confirm-run").small().label(if dangerous { "Run destructive SQL" } else { "Run" }).when(dangerous, |b| b.danger()).when(!dangerous, |b| b.primary()).on_click(
                     move |_, window, cx| {
                         let confirm = dangerous.then(|| conn.clone());
-                        let _ = view.update(cx, |this, cx| this.execute(conn.clone(), sql.clone(), class, confirm, cx));
+                        let _ = view.update(cx, |this, cx| {
+                            this.execute(conn.clone(), sql.clone(), class, confirm, cx);
+                            if dangerous && let Err(e) = crate::tasks::db::approve_statement(&this.root, &sql) {
+                                this.status = format!("Approval not recorded for agents: {e}").into();
+                            }
+                        });
                         window.close_dialog(cx);
                     },
                 )
@@ -349,7 +354,7 @@ impl DatabasePanel {
                         )
                         .children(reasons.iter().map(|r| div().text_size(px(12.)).text_color(edge).child(r.clone())))
                         .child(div().text_size(px(12.)).text_color(p.muted).child(if dangerous {
-                            "This statement cannot be undone. It runs on a read-write connection after you confirm (TANDEM_DB_CONFIRM)."
+                            "This statement cannot be undone. It runs on a read-write connection after you confirm, and agents exposed to this database with dangerous SQL allowed may run it too."
                         } else {
                             "Runs on a read-write connection."
                         })),
@@ -365,7 +370,7 @@ impl DatabasePanel {
     }
 
     /// Run `sql`; `confirm` is the connection name the user confirmed a Dangerous statement for
-    /// (the IDE-side equivalent of `TANDEM_DB_CONFIRM`).
+    /// in the red confirm dialog.
     pub fn execute(&mut self, conn: String, sql: String, class: SqlClass, confirm: Option<String>, cx: &mut Context<Self>) {
         let policy = crate::tasks::db::panel_policy(confirm.as_deref() == Some(conn.as_str()));
         if let Err(why) = policy.check(class, &sql) {

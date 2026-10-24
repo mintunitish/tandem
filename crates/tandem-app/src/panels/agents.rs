@@ -4,7 +4,7 @@
 
 use crate::assets::icon;
 use crate::keymap::StopAllAgents;
-use crate::model::agents::{AgentTask, AgentsModel, TaskStatus, agent_badge};
+use crate::model::agents::{AgentTask, AgentsModel, Badge, TaskStatus};
 use crate::panels::chip;
 use crate::panels::review::ReviewInput;
 use crate::runtime::spawn_bridge;
@@ -24,9 +24,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tandem_acp::{AgentHandle, Availability, DetectedAgent};
+use tandem_core::fmt::{ellipsize, fmt_tokens};
 use tandem_core::{
-    AgentEvent, AgentId, Decider, PermissionDecision, PermissionOptionKind, PermissionRequest, Policy, RiskClass, Role, TaskEvent,
-    TaskId, TaskPhase, ToolCall, ToolCallId, ToolKind, ToolStatus,
+    AgentDescriptor, AgentEvent, AgentId, Decider, PermissionOptionKind, PermissionRequest, Policy, RiskClass, Role, TaskEvent, TaskId,
+    TaskPhase, ToolCall, ToolCallId, ToolKind, ToolStatus,
 };
 use tandem_quota::{QuotaPool, RouteRequest, TurnRecord, Unit, WindowKind};
 use tandem_skills::Preset;
@@ -49,6 +50,9 @@ pub enum Choice {
     Reject,
 }
 
+/// Transcript events rendered per task until "Show earlier" is clicked.
+const TRANSCRIPT_TAIL: usize = 500;
+
 /// Skill preset chips, in display order.
 pub const PRESETS: &[(Preset, &str)] =
     &[(Preset::Lazy, "Lazy"), (Preset::Terse, "Terse"), (Preset::Disciplined, "Disciplined"), (Preset::Ship, "Ship"), (Preset::TandemDefault, "Tandem")];
@@ -67,6 +71,10 @@ pub struct AgentsPanel {
     pub presets: HashSet<Preset>,
     pub kill_tripped: bool,
     expanded: HashSet<(TaskId, ToolCallId)>,
+    /// Tasks whose whole transcript is shown (not just the last `TRANSCRIPT_TAIL` events).
+    full_transcript: HashSet<TaskId>,
+    /// Agent detection still running (the quota pool waits for it).
+    detecting: bool,
     _tick: Task<()>,
 }
 
@@ -75,9 +83,6 @@ impl EventEmitter<AgentsEvent> for AgentsPanel {}
 impl AgentsPanel {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder("Describe a task for an agent…  (⌘⏎ to start)"));
-        let detected = tasks::detect_agents(&root);
-        let mut model = AgentsModel { tasks: store::restore(&root), ..Default::default() };
-        model.selected = model.tasks.len().saturating_sub(1);
         let tick = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -94,8 +99,8 @@ impl AgentsPanel {
         let mut this = Self {
             policy: crate::state::load_policy(&root),
             root,
-            model,
-            detected,
+            model: AgentsModel::default(),
+            detected: vec![],
             pool: None,
             handles: HashMap::new(),
             composer,
@@ -104,12 +109,42 @@ impl AgentsPanel {
             presets: [Preset::Disciplined, Preset::TandemDefault].into_iter().collect(),
             kill_tripped: tandem_sandbox::KillSwitch::global().is_tripped(),
             expanded: HashSet::new(),
+            full_transcript: HashSet::new(),
+            detecting: true,
             _tick: tick,
         };
-        this.load_restored_diffs(cx);
+        this.load_in_background(cx);
         #[cfg(feature = "test-support")]
         this.demo_hooks(cx);
         this
+    }
+
+    /// Agent detection (PATH scan) and the task list restore (replay logs) run off the UI
+    /// thread; the window opens immediately and both fill in when done.
+    fn load_in_background(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let rx = spawn_bridge(async move {
+            tokio::task::spawn_blocking(move || (tasks::detect_agents(&root), store::restore(&root))).await.unwrap_or_default()
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok((detected, restored)) = rx.recv().await else { return };
+            let _ = this.update(cx, |this, cx| {
+                // Agents registered meanwhile (custom agents, tests) win over detection.
+                for d in std::mem::replace(&mut this.detected, detected) {
+                    this.detected.retain(|x| x.descriptor.id != d.descriptor.id);
+                    this.detected.push(d);
+                }
+                this.detecting = false;
+                let n = restored.len();
+                let live = std::mem::replace(&mut this.model.tasks, restored);
+                this.model.selected = if live.is_empty() { n.saturating_sub(1) } else { this.model.selected + n };
+                this.model.tasks.extend(live);
+                this.load_restored_diffs(cx);
+                cx.emit(AgentsEvent::Changed);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Recompute diffs of restored tasks whose worktree still exists (Review badges and
@@ -157,7 +192,7 @@ impl AgentsPanel {
     fn demo_hooks(&mut self, cx: &mut Context<Self>) {
         if let Some(bin) = std::env::var_os("TANDEM_DEMO_AGENT") {
             self.add_agent(
-                tandem_core::AgentDescriptor {
+                AgentDescriptor {
                     id: "fake".into(),
                     display_name: "Scripted demo agent".into(),
                     vendor: "Tandem".into(),
@@ -182,10 +217,11 @@ impl AgentsPanel {
 
     /// Start the quota pool on first use (first render), so opening a project does not spawn
     /// provider processes until the cockpit is visible.
-    fn ensure_quota(&mut self) {
-        if self.pool.is_none() {
-            let ids = self.detected.iter().map(|d| d.descriptor.id.clone()).collect();
-            let pool = tasks::quota::start_pool(ids);
+    fn ensure_quota(&mut self, cx: &App) {
+        if self.pool.is_none() && !self.detecting {
+            let descs = self.detected.iter().map(|d| d.descriptor.clone()).collect();
+            let mode = cx.try_global::<tasks::quota::QuotaMode>().map_or(tandem_quota::providers::Mode::Live, |m| m.0);
+            let pool = tasks::quota::start_pool(descs, mode);
             self.model.pool = pool.state();
             self.pool = Some(pool);
         }
@@ -203,7 +239,7 @@ impl AgentsPanel {
     }
 
     /// Register an extra ACP agent (custom agents, tests).
-    pub fn add_agent(&mut self, desc: tandem_core::AgentDescriptor, cx: &mut Context<Self>) {
+    pub fn add_agent(&mut self, desc: AgentDescriptor, cx: &mut Context<Self>) {
         self.detected.retain(|d| d.descriptor.id != desc.id);
         let path = PathBuf::from(&desc.command);
         self.detected.push(DetectedAgent { descriptor: desc, availability: Availability::Installed(path) });
@@ -216,6 +252,14 @@ impl AgentsPanel {
 
     pub fn set_composer_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.composer.update(cx, |c, cx| c.set_value(text.to_string(), window, cx));
+    }
+
+    /// Avatar + display name: the detected descriptor (custom agents), else the registry.
+    pub fn badge(&self, agent: &AgentId) -> Badge {
+        match self.detected.iter().find(|d| &d.descriptor.id == agent) {
+            Some(d) => Badge::of(&d.descriptor),
+            None => Badge::for_agent(agent),
+        }
     }
 
     fn installed_ids(&self) -> Vec<AgentId> {
@@ -249,7 +293,7 @@ impl AgentsPanel {
             .map(|t| TurnRecord { agent: t.agent.clone(), usage: t.usage.clone(), elapsed: t.elapsed().to_std().unwrap_or_default() })
             .collect();
         let est = tandem_quota::estimate(&history, agent);
-        let name = agent_badge(agent).2;
+        let name = self.badge(agent).name;
         if est.samples == 0 {
             return format!("no {name} history yet: estimate after the first task");
         }
@@ -291,7 +335,7 @@ impl AgentsPanel {
             cx.emit(AgentsEvent::Toast(format!("{agent} is not installed").into()));
             return None;
         };
-        self.ensure_quota();
+        self.ensure_quota(cx);
         let id = tasks::new_task_id(&agent);
         let presets: Vec<Preset> = PRESETS.iter().map(|(p, _)| *p).filter(|p| self.presets.contains(p)).collect();
         let (mcp, notes) = db::mcp_specs(&self.root);
@@ -310,11 +354,21 @@ impl AgentsPanel {
         Some(id)
     }
 
+    /// Apply the task's messages in batches: everything queued is drained before one repaint.
     fn listen(&mut self, id: TaskId, rx: async_channel::Receiver<TaskMsg>, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            while let Ok(msg) = rx.recv().await {
-                let id = id.clone();
-                if this.update(cx, |this, cx| this.on_msg(id, msg, cx)).is_err() {
+            while let Ok(first) = rx.recv().await {
+                let mut batch = vec![first];
+                while let Ok(m) = rx.try_recv() {
+                    batch.push(m);
+                }
+                let alive = this.update(cx, |this, cx| {
+                    for msg in batch {
+                        this.on_msg(&id, msg, cx);
+                    }
+                    cx.notify();
+                });
+                if alive.is_err() {
                     break;
                 }
             }
@@ -322,25 +376,25 @@ impl AgentsPanel {
         .detach();
     }
 
-    fn on_msg(&mut self, id: TaskId, msg: TaskMsg, cx: &mut Context<Self>) {
-        let before = self.model.task(&id).map(|t| t.status);
+    fn on_msg(&mut self, id: &TaskId, msg: TaskMsg, cx: &mut Context<Self>) {
+        let before = self.model.task(id).map(|t| t.status);
         match msg {
             TaskMsg::Prepared { worktree, base, notes } => {
-                if let Some(t) = self.model.task_mut(&id) {
+                if let Some(t) = self.model.task_mut(id) {
                     t.worktree = Some(worktree);
                     t.base_commit = Some(base);
                     t.notes.extend(notes);
                 }
             }
             TaskMsg::Spawned(h) => {
-                if self.model.task(&id).is_some() {
+                if self.model.task(id).is_some() {
                     self.handles.insert(id.clone(), h);
                 }
             }
             TaskMsg::Event(ev) => self.model.apply(TaskEvent { task: id.clone(), event: *ev }),
             TaskMsg::Diff(ds) => {
                 let n = ds.files.len();
-                if let Some(t) = self.model.task_mut(&id) {
+                if let Some(t) = self.model.task_mut(id) {
                     t.diff = Some(*ds);
                 }
                 if n > 0 {
@@ -349,7 +403,7 @@ impl AgentsPanel {
                 }
             }
             TaskMsg::Failed(err) => {
-                if let Some(t) = self.model.task_mut(&id) {
+                if let Some(t) = self.model.task_mut(id) {
                     t.status = TaskStatus::Failed;
                     t.error = Some(err.clone());
                     t.finished_at = Some(Utc::now());
@@ -357,13 +411,12 @@ impl AgentsPanel {
                 cx.emit(AgentsEvent::Toast(format!("Task failed: {err}").into()));
             }
         }
-        if let Some(t) = self.model.task(&id)
+        if let Some(t) = self.model.task(id)
             && Some(t.status) != before
         {
             store::save(&self.root, t);
             cx.emit(AgentsEvent::Changed);
         }
-        cx.notify();
     }
 
     /// Answer a permission card. Allow always on a shell command also trusts it for future tasks
@@ -371,10 +424,6 @@ impl AgentsPanel {
     pub fn decide(&mut self, task: &TaskId, req: &PermissionRequest, choice: Choice, cx: &mut Context<Self>) {
         let Some(handle) = self.handles.get(task).cloned() else {
             cx.emit(AgentsEvent::Toast("The agent process for this task has ended; nothing to answer.".into()));
-            return;
-        };
-        let Some(option_id) = pick_option(req, choice) else {
-            cx.emit(AgentsEvent::Toast("The agent offered no matching option".into()));
             return;
         };
         if choice == Choice::AllowAlways && req.risk != RiskClass::Destructive && req.tool_call.kind == ToolKind::Execute {
@@ -388,8 +437,13 @@ impl AgentsPanel {
         if let Some(t) = self.model.task_mut(task) {
             t.deciding.push(req.id.clone());
         }
-        let decision = PermissionDecision { request: req.id.clone(), option_id };
-        let rx = spawn_bridge(async move { handle.respond_permission(decision, Decider::User).await });
+        let kind = match choice {
+            Choice::AllowOnce => PermissionOptionKind::AllowOnce,
+            Choice::AllowAlways => PermissionOptionKind::AllowAlways,
+            Choice::Reject => PermissionOptionKind::RejectOnce,
+        };
+        let r = req.clone();
+        let rx = spawn_bridge(async move { handle.respond_choice(&r, kind, Decider::User).await });
         let (task, rid) = (task.clone(), req.id.clone());
         cx.spawn(async move |this, cx| {
             if let Ok(Err(e)) = rx.recv().await {
@@ -415,7 +469,11 @@ impl AgentsPanel {
 
     /// Remove the task: its agent, worktree, branch and `.tandem/tasks/<id>`.
     pub fn delete_task(&mut self, task: &TaskId, cx: &mut Context<Self>) {
-        self.handles.remove(task);
+        if let Some(h) = self.handles.remove(task) {
+            // The idle agent process still holds the worktree: stop its process group.
+            let _ = spawn_bridge(async move { tokio::task::spawn_blocking(move || h.kill_group(Duration::from_secs(2))).await });
+        }
+        self.full_transcript.remove(task);
         let Some(ix) = self.model.tasks.iter().position(|t| &t.id == task) else { return };
         self.model.tasks.remove(ix);
         self.model.selected = self.model.selected.min(self.model.tasks.len().saturating_sub(1));
@@ -438,17 +496,13 @@ impl AgentsPanel {
         cx.notify();
     }
 
-    /// Send a follow-up prompt to an idle task whose agent is still alive.
+    /// Send a follow-up prompt to an idle task whose agent is still alive. The handle emits the
+    /// prompt as a user `TextDelta`, which reaches the replay log and the transcript.
     pub fn reply(&mut self, task: &TaskId, prompt: String, cx: &mut Context<Self>) {
         let Some(h) = self.handles.get(task).cloned() else { return };
-        let ev = AgentEvent::TextDelta { role: Role::User, text: prompt.clone() };
-        if let Ok(mut log) = tandem_acp::ReplayLog::open(tasks::task_dir(&self.root, task)) {
-            let _ = log.record(task, &ev);
-        }
         if let Some(t) = self.model.task_mut(task) {
             t.status = TaskStatus::Running;
             t.finished_at = None;
-            t.events.push(ev);
         }
         let _ = spawn_bridge(async move { h.prompt(prompt).await });
         cx.emit(AgentsEvent::Changed);
@@ -558,8 +612,7 @@ impl AgentsPanel {
         let mut cards: Vec<AnyElement> = Vec::new();
         for (ix, d) in self.detected.iter().enumerate() {
             let id = &d.descriptor.id;
-            let (letter, color, name) = agent_badge(id);
-            let name = if name == "Agent" { d.descriptor.display_name.clone() } else { name.to_string() };
+            let badge = Badge::of(&d.descriptor);
             let snap = self.model.pool.snapshots.get(id);
             let mut rows: Vec<AnyElement> = Vec::new();
             if let Some(s) = snap {
@@ -588,22 +641,22 @@ impl AgentsPanel {
             }
             let plan = snap.and_then(|s| s.plan.clone());
             let installable = matches!(d.availability, Availability::Installable);
-            let login = tasks::login_command(id, &d.descriptor.auth_note);
-            let title = format!("Sign in to {name}");
+            let login = tasks::login_command(&d.descriptor);
+            let title = format!("Sign in to {}", badge.name);
             cards.push(
                 h_flex()
                     .id(("quota-agent", ix))
                     .flex_none()
                     .gap(px(8.))
                     .items_start()
-                    .child(avatar_owned(letter, color, 20.))
+                    .child(avatar(badge.letters, badge.color, 20.))
                     .child(
                         v_flex()
                             .gap(px(3.))
                             .child(
                                 h_flex()
                                     .gap(px(6.))
-                                    .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.text).child(name.clone()))
+                                    .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.text).child(badge.name))
                                     .children(plan.map(|pl| div().text_size(px(11.)).text_color(p.muted).child(pl)))
                                     .when(installable, |d| d.child(chip("via npx", p.warning, p.warning.opacity(0.15))))
                                     .children(login.map(|(program, args)| {
@@ -655,7 +708,7 @@ impl AgentsPanel {
     }
 
     fn render_task_row(&self, ix: usize, t: &AgentTask, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let (letter, color, _) = agent_badge(&t.agent);
+        let badge = self.badge(&t.agent);
         let selected = self.model.selected == ix;
         let (fg, bg) = status_colors(t.status, p);
         v_flex()
@@ -675,7 +728,7 @@ impl AgentsPanel {
             .child(
                 h_flex()
                     .gap(px(8.))
-                    .child(avatar(letter, color, 18.))
+                    .child(avatar(badge.letters, badge.color, 18.))
                     .child(div().flex_1().text_size(px(13.)).text_color(p.text).whitespace_nowrap().overflow_hidden().text_ellipsis().child(t.title.clone())),
             )
             .child(
@@ -703,26 +756,43 @@ impl AgentsPanel {
                 .child(div().text_size(px(12.)).child("Each task runs in its own git worktree under .tandem/worktrees/"))
                 .into_any_element();
         };
-        let (letter, color, agent_name) = agent_badge(&t.agent);
+        let badge = self.badge(&t.agent);
         let mut items: Vec<AnyElement> = Vec::new();
         for n in &t.notes {
             items.push(h_flex().gap(px(6.)).text_size(px(12.)).text_color(p.muted).child(icon(IconName::Database, 12., p.muted)).child(n.clone()).into_any_element());
         }
-        let mut seen_tools: HashSet<ToolCallId> = HashSet::new();
-        for (i, ev) in t.events.iter().enumerate() {
+        let skip = if self.full_transcript.contains(&t.id) { 0 } else { t.events.len().saturating_sub(TRANSCRIPT_TAIL) };
+        if skip > 0 {
+            let id = t.id.clone();
+            items.push(
+                Button::new("show-earlier")
+                    .xsmall()
+                    .ghost()
+                    .label(format!("Show {skip} earlier events"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.full_transcript.insert(id.clone());
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let mut seen_tools: HashSet<&ToolCallId> = HashSet::new();
+        for (i, ev) in t.events.iter().enumerate().skip(skip) {
             match ev {
-                AgentEvent::TextDelta { role: Role::User, text } => {
-                    items.push(div().p(px(10.)).rounded(px(8.)).bg(p.stripe_selected).text_color(p.text).child(text.clone()).into_any_element())
+                AgentEvent::TextDelta { role, .. } => {
+                    let text = t.label(i).unwrap_or_default();
+                    items.push(match role {
+                        Role::User => div().p(px(10.)).rounded(px(8.)).bg(p.stripe_selected).text_color(p.text).child(text),
+                        Role::Thought => div().italic().text_size(px(12.)).text_color(p.muted).child(text),
+                        Role::Assistant => div().text_color(p.text).child(text),
+                    }
+                    .into_any_element())
                 }
-                AgentEvent::TextDelta { role: Role::Thought, text } => {
-                    items.push(div().italic().text_size(px(12.)).text_color(p.muted).child(format!("Thinking: {}", text.trim())).into_any_element())
-                }
-                AgentEvent::TextDelta { role: Role::Assistant, text } => items.push(div().text_color(p.text).child(text.clone()).into_any_element()),
                 AgentEvent::ToolCall(tc) | AgentEvent::ToolCallUpdate(tc) => {
-                    if seen_tools.insert(tc.id.clone()) {
-                        let merged = t.merged_tool(&tc.id).unwrap_or_else(|| tc.clone());
+                    if seen_tools.insert(&tc.id) {
+                        let merged = t.merged_tool(&tc.id).unwrap_or(tc);
                         let open = self.expanded.contains(&(t.id.clone(), tc.id.clone()));
-                        items.push(self.tool_card(i, &t.id, &merged, open, p, cx).into_any_element());
+                        items.push(self.tool_card(i, &t.id, merged, open, p, cx).into_any_element());
                     }
                 }
                 AgentEvent::Plan { entries } => items.push(
@@ -792,8 +862,8 @@ impl AgentsPanel {
                     .gap(px(8.))
                     .border_b_1()
                     .border_color(p.border)
-                    .child(avatar(letter, color, 18.))
-                    .child(div().flex_none().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(agent_name))
+                    .child(avatar(badge.letters, badge.color, 18.))
+                    .child(div().flex_none().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(badge.name))
                     .child(div().flex_1().min_w_0().text_size(px(12.)).text_color(p.muted).whitespace_nowrap().overflow_hidden().text_ellipsis().child(format!("· {}", t.title)))
                     .child(h_flex().flex_none().gap(px(4.)).text_size(px(11.)).text_color(p.muted).child(icon(IconName::GitBranch, 12., p.muted)).child(worktree))
                     .when(diff_files > 0 || (t.restored && t.worktree.is_some()), |d| {
@@ -875,10 +945,10 @@ impl AgentsPanel {
                 detail.push(div().text_size(px(11.)).text_color(p.muted).child(l.display().to_string()).into_any_element());
             }
             if let Some(d) = &tc.diff {
-                detail.push(mono(crate::model::review::to_unified_patch(d)));
+                detail.push(mono(d.to_patch()));
             }
             if let Some(c) = &tc.content {
-                detail.push(mono(truncate(c, 4000)));
+                detail.push(mono(ellipsize(c, 4000)));
             }
             if detail.is_empty() {
                 detail.push(div().text_size(px(11.)).text_color(p.muted).child("No input or output reported").into_any_element());
@@ -1009,10 +1079,10 @@ impl AgentsPanel {
     fn render_composer(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let phase = phase_label(self.phase);
         let route = self.route();
-        let (picker_label, picker_avatar): (String, Option<(&'static str, u32)>) = match &self.pinned {
+        let (picker_label, picker_avatar): (SharedString, Option<(SharedString, u32)>) = match &self.pinned {
             Some(a) => {
-                let (l, c, n) = agent_badge(a);
-                (n.to_string(), Some((l, c)))
+                let b = self.badge(a);
+                (b.name, Some((b.letters, b.color)))
             }
             None => ("Route for me".into(), None),
         };
@@ -1069,7 +1139,7 @@ impl AgentsPanel {
                             .child(
                                 h_flex()
                                     .gap(px(6.))
-                                    .children(picker_avatar.map(|(l, c)| avatar(l, c, 16.)))
+                                    .children(picker_avatar.clone().map(|(l, c)| avatar(l, c, 16.)))
                                     .when(picker_avatar.is_none(), |d| d.child(icon(IconName::Sparkles, 14., p.accent)))
                                     .child(picker_label)
                                     .child(icon(IconName::ChevronDown, 12., p.muted)),
@@ -1149,7 +1219,7 @@ impl AgentsPanel {
                 h_flex()
                     .gap(px(8.))
                     .when_some(route.filter(|_| self.pinned.is_none()), |d, r| {
-                        let (l, c, n) = agent_badge(&r.agent);
+                        let b = self.badge(&r.agent);
                         d.child(
                             h_flex()
                                 .id("route-chip")
@@ -1162,8 +1232,8 @@ impl AgentsPanel {
                                 .text_size(px(11.))
                                 .text_color(p.text)
                                 .child(icon(IconName::Sparkles, 12., p.accent))
-                                .child(avatar(l, c, 14.))
-                                .child(div().whitespace_nowrap().child(format!("→ {n}")))
+                                .child(avatar(b.letters, b.color, 14.))
+                                .child(div().whitespace_nowrap().child(format!("→ {}", b.name)))
                                 .child(div().min_w_0().whitespace_nowrap().overflow_hidden().text_ellipsis().text_color(p.muted).child(r.reason)),
                         )
                     })
@@ -1197,16 +1267,6 @@ impl AgentsPanel {
     }
 }
 
-fn pick_option(req: &PermissionRequest, choice: Choice) -> Option<String> {
-    let by_kind = |k: PermissionOptionKind| req.options.iter().find(|o| o.kind == k).map(|o| o.id.clone());
-    let by_word = |w: &str| req.options.iter().find(|o| o.id.to_lowercase().contains(w) || o.label.to_lowercase().contains(w)).map(|o| o.id.clone());
-    match choice {
-        Choice::AllowOnce => by_kind(PermissionOptionKind::AllowOnce).or_else(|| by_kind(PermissionOptionKind::AllowAlways)).or_else(|| by_word("allow")),
-        Choice::AllowAlways => by_kind(PermissionOptionKind::AllowAlways).or_else(|| by_kind(PermissionOptionKind::AllowOnce)).or_else(|| by_word("allow")),
-        Choice::Reject => by_kind(PermissionOptionKind::RejectOnce).or_else(|| by_kind(PermissionOptionKind::RejectAlways)).or_else(|| by_word("reject")),
-    }
-}
-
 /// The exact shell command / input behind a tool call.
 pub fn command_of(tc: &ToolCall) -> String {
     tc.raw_input.clone().unwrap_or_default().trim().to_string()
@@ -1228,20 +1288,6 @@ fn usage_line(t: &AgentTask) -> Vec<String> {
         v.push(format!("routed: {r}"));
     }
     v
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.to_string() } else { format!("{}…\n[{} more characters]", s.chars().take(n).collect::<String>(), s.chars().count() - n) }
-}
-
-pub fn fmt_tokens(t: u64) -> String {
-    if t >= 1_000_000 {
-        format!("{:.1}M", t as f64 / 1e6)
-    } else if t >= 1_000 {
-        format!("{:.1}k", t as f64 / 1e3)
-    } else {
-        t.to_string()
-    }
 }
 
 fn fmt_secs(s: f64) -> String {
@@ -1278,11 +1324,8 @@ fn status_colors(s: TaskStatus, p: &Palette) -> (Hsla, Hsla) {
     }
 }
 
-pub fn avatar(letter: &'static str, color: u32, size: f32) -> impl IntoElement {
-    avatar_owned(letter, color, size)
-}
-
-fn avatar_owned(letter: impl Into<SharedString>, color: u32, size: f32) -> Div {
+/// Round agent avatar: badge letters on the badge color.
+pub fn avatar(letter: impl Into<SharedString>, color: u32, size: f32) -> Div {
     div()
         .size(px(size))
         .flex_none()
@@ -1299,10 +1342,9 @@ fn avatar_owned(letter: impl Into<SharedString>, color: u32, size: f32) -> Div {
 
 impl Render for AgentsPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ensure_quota();
+        self.ensure_quota(cx);
         let p = pal(cx).clone();
-        let rows: Vec<(usize, AgentTask)> = self.model.tasks.iter().cloned().enumerate().collect();
-        let tasks: Vec<AnyElement> = rows.iter().rev().map(|(i, t)| self.render_task_row(*i, t, &p, cx).into_any_element()).collect();
+        let tasks: Vec<AnyElement> = self.model.tasks.iter().enumerate().rev().map(|(i, t)| self.render_task_row(i, t, &p, cx).into_any_element()).collect();
         let waiting = self.model.waiting_count();
         v_flex()
             .size_full()
@@ -1362,23 +1404,11 @@ mod tests {
     use super::*;
     // `gpui_kit::*` exports its own `test` attribute; use the std one.
     use core::prelude::v1::test;
-    use tandem_core::{PermissionOption, RequestId};
 
     #[test]
-    fn picks_options_by_kind_with_fallbacks() {
-        let req = PermissionRequest {
-            id: RequestId::from("r"),
-            tool_call: ToolCall { id: "t".into(), title: "x".into(), kind: ToolKind::Execute, status: ToolStatus::Pending, locations: vec![], raw_input: Some(" npm test ".into()), content: None, diff: None },
-            options: vec![
-                PermissionOption { id: "allow".into(), label: "Allow".into(), kind: PermissionOptionKind::AllowOnce },
-                PermissionOption { id: "reject".into(), label: "Reject".into(), kind: PermissionOptionKind::RejectOnce },
-            ],
-            risk: RiskClass::Review,
-            reason: String::new(),
-        };
-        assert_eq!(pick_option(&req, Choice::AllowAlways).as_deref(), Some("allow"));
-        assert_eq!(pick_option(&req, Choice::Reject).as_deref(), Some("reject"));
-        assert_eq!(command_of(&req.tool_call), "npm test");
+    fn command_and_countdown_labels() {
+        let tc = ToolCall { id: "t".into(), title: "x".into(), kind: ToolKind::Execute, status: ToolStatus::Pending, locations: vec![], raw_input: Some(" npm test ".into()), content: None, diff: None };
+        assert_eq!(command_of(&tc), "npm test");
         assert_eq!(countdown(chrono::Duration::minutes(134)), "in 2h 14m");
     }
 }

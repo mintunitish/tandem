@@ -1,8 +1,9 @@
-//! Project tool window: `tandem_project::FileTree` kept live by a `Watcher`, git status colors
-//! from `tandem_git::Repo::status`, and the New/Rename/Delete/Reveal/Copy Path context menu.
+//! Project tool window: `tandem_project::FileTree` kept live by the project watcher
+//! (`ProjectModel`), git status colors from `tandem_git::Repo::status`, and the
+//! New/Rename/Delete/Reveal/Copy Path context menu.
 
 use crate::assets::{file_icon, icon};
-use crate::model::GitFileStatus;
+use crate::model::project::{ProjectModel, ProjectModelEvent};
 use crate::theme::{Palette, pal};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariant;
@@ -13,7 +14,16 @@ use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tandem_project::{FileTree, Watcher, icon_for_entry};
+use tandem_project::{FileTree, icon_for_entry};
+
+/// Git working-tree status of one file, as the tree colors it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Untracked,
+}
 
 actions!(
     project_panel,
@@ -46,8 +56,7 @@ pub struct ProjectPanel {
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
     name_input: Entity<InputState>,
-    _watcher: Option<Watcher>,
-    _tasks: Vec<Task<()>>,
+    _sub: Subscription,
 }
 
 impl EventEmitter<ProjectEvent> for ProjectPanel {}
@@ -93,32 +102,22 @@ pub fn git_status_map(root: &Path) -> HashMap<PathBuf, GitFileStatus> {
 }
 
 impl ProjectPanel {
-    pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(root: PathBuf, model: &Entity<ProjectModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tree = FileTree::new(&root);
-        let watcher = Watcher::new(&root).ok();
-        let mut tasks = Vec::new();
-        if let Some(w) = &watcher {
-            let rx = w.events();
-            tasks.push(cx.spawn(async move |this, cx| {
-                while let Ok(ev) = rx.recv().await {
-                    let mut evs = vec![ev];
-                    while let Ok(e) = rx.try_recv() {
-                        evs.push(e);
-                    }
-                    let alive = this.update(cx, |p, cx| {
-                        for ev in &evs {
-                            p.tree.apply_event(ev);
-                        }
-                        p.rebuild();
-                        p.refresh_git(cx);
-                        cx.notify();
-                    });
-                    if alive.is_err() {
-                        break;
-                    }
-                }
-            }));
-        }
+        // One batch of watcher events: rebuild rows only when a listing changed; git status
+        // is recomputed once per batch (content edits change it too).
+        let sub = cx.subscribe(model, |p: &mut Self, _, ev: &ProjectModelEvent, cx| {
+            let ProjectModelEvent::Fs(batch) = ev else { return };
+            let mut changed = false;
+            for ev in batch.iter() {
+                changed |= !p.tree.apply_event(ev).is_empty();
+            }
+            if changed {
+                p.rebuild();
+                cx.notify();
+            }
+            p.refresh_git(cx);
+        });
         let name_input = cx.new(|cx| InputState::new(window, cx));
         let mut this = Self {
             root,
@@ -131,8 +130,7 @@ impl ProjectPanel {
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             name_input,
-            _watcher: watcher,
-            _tasks: tasks,
+            _sub: sub,
         };
         this.rebuild();
         this.refresh_git(cx);

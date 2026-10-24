@@ -4,7 +4,7 @@
 
 use super::database::StringTable;
 use crate::assets::icon;
-use crate::model::agents::agent_badge;
+use crate::model::agents::Badge;
 use crate::runtime;
 use crate::theme::{Palette, pal};
 use gpui_kit::assets::IconName;
@@ -13,10 +13,11 @@ use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tandem_core::AgentId;
+use tandem_core::fmt::{ellipsize, fmt_tokens};
 use tandem_harness::{AcpRunner, AgentRunner, BenchTask, Report, RunKind, RunOptions, RunResult, Scenario, Status};
 
 enum Progress {
@@ -40,6 +41,8 @@ pub struct HarnessPanel {
     pub report: Option<Report>,
     pub report_dir: Option<PathBuf>,
     load_error: Option<String>,
+    /// Matrix cell text per (scenario/task id, agent): the latest result wins.
+    cells: HashMap<(String, AgentId), String>,
     matrix: Entity<TableState<StringTable>>,
     board: Entity<TableState<StringTable>>,
     svg: Option<Arc<Image>>,
@@ -56,56 +59,76 @@ pub fn find_harness_root(root: &Path) -> Option<PathBuf> {
 
 impl HarnessPanel {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let harness_root = find_harness_root(&root);
-        let mut load_error = None;
-        let (scenarios, bench) = match &harness_root {
-            Some(h) => {
-                let s = tandem_harness::load_scenarios(&h.join("scenarios")).unwrap_or_else(|e| {
-                    load_error = Some(format!("scenarios: {e:#}"));
-                    vec![]
-                });
-                let b = tandem_harness::load_bench(&h.join("bench")).unwrap_or_default();
-                (s, b)
-            }
-            None => (vec![], vec![]),
-        };
-        let agents = AcpRunner::detect().agents();
         let matrix = cx.new(|cx| TableState::new(StringTable::new(vec![], vec![], false), window, cx));
         let board = cx.new(|cx| TableState::new(StringTable::new(vec![], vec![], false), window, cx));
-        let mut this = Self {
-            selected_agents: agents.iter().cloned().collect(),
-            agents,
-            selected_scenarios: scenarios.iter().map(|s| s.id.clone()).collect(),
-            scenarios,
-            selected_bench: bench.iter().map(|b| b.id.clone()).collect(),
-            bench,
-            harness_root,
+        let this = Self {
+            harness_root: find_harness_root(&root),
+            agents: vec![],
+            selected_agents: HashSet::new(),
+            scenarios: vec![],
+            selected_scenarios: HashSet::new(),
+            bench: vec![],
+            selected_bench: HashSet::new(),
             running: None,
             current: None,
             total: 0,
             results: vec![],
             report: None,
             report_dir: None,
-            load_error,
+            load_error: None,
+            cells: HashMap::new(),
             matrix,
             board,
             svg: None,
         };
-        this.load_latest(cx);
+        this.load(cx);
         this
     }
 
-    /// Show the newest report under `harness/reports/` (read-only).
-    fn load_latest(&mut self, cx: &mut Context<Self>) {
-        let Some(h) = &self.harness_root else { return };
-        let Ok(dirs) = std::fs::read_dir(h.join("reports")) else { return };
-        let mut dirs: Vec<PathBuf> = dirs.flatten().map(|d| d.path()).filter(|p| p.join("report.json").is_file()).collect();
-        dirs.sort();
-        let Some(dir) = dirs.pop() else { return };
-        if let Some(r) = std::fs::read_to_string(dir.join("report.json")).ok().and_then(|s| serde_json::from_str::<Report>(&s).ok()) {
-            self.results = r.results.clone();
-            self.set_report(r, dir, cx);
+    /// Scenario / bench YAML, agent detection and the newest report under `harness/reports/`
+    /// load on the tokio runtime; the panel fills in when they are parsed.
+    fn load(&self, cx: &mut Context<Self>) {
+        let Some(h) = self.harness_root.clone() else { return };
+        let rx = runtime::spawn_bridge(async move {
+            tokio::task::spawn_blocking(move || {
+                let scenarios = tandem_harness::load_scenarios(&h.join("scenarios")).map_err(|e| format!("scenarios: {e:#}"));
+                let bench = tandem_harness::load_bench(&h.join("bench")).unwrap_or_default();
+                (scenarios, bench, AcpRunner::detect().agents(), latest_report(&h))
+            })
+            .await
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok((scenarios, bench, agents, latest))) = rx.recv().await else { return };
+            let _ = this.update(cx, |this, cx| {
+                let scenarios = scenarios.unwrap_or_else(|e| {
+                    this.load_error = Some(e);
+                    vec![]
+                });
+                this.selected_agents = agents.iter().cloned().collect();
+                this.agents = agents;
+                this.selected_scenarios = scenarios.iter().map(|s| s.id.clone()).collect();
+                this.scenarios = scenarios;
+                this.selected_bench = bench.iter().map(|b| b.id.clone()).collect();
+                this.bench = bench;
+                if let Some((r, dir)) = latest
+                    && this.running.is_none()
+                {
+                    this.set_results(r.results.clone());
+                    this.set_report(r, dir, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Replace the results and rebuild the matrix cells.
+    fn set_results(&mut self, results: Vec<RunResult>) {
+        self.cells.clear();
+        for r in &results {
+            self.cells.insert((r.id.clone(), r.agent.clone()), cell(r));
         }
+        self.results = results;
     }
 
     fn set_report(&mut self, r: Report, dir: PathBuf, cx: &mut Context<Self>) {
@@ -118,34 +141,24 @@ impl HarnessPanel {
 
     fn refresh_tables(&mut self, cx: &mut Context<Self>) {
         // Matrix: one row per scenario/task id, one column per agent.
-        let mut agents: Vec<AgentId> = vec![];
-        let mut ids: Vec<(String, String)> = vec![];
-        for r in &self.results {
-            if !agents.contains(&r.agent) {
-                agents.push(r.agent.clone());
-            }
-            if !ids.iter().any(|(i, _)| i == &r.id) {
-                ids.push((r.id.clone(), r.title.clone()));
+        let report = Report::new("live", "acp", self.results.clone());
+        let agents = report.agents();
+        let mut ids: Vec<String> = vec![];
+        for (id, _, _) in report.ids(RunKind::Conformance).into_iter().chain(report.ids(RunKind::Bench)) {
+            if !ids.contains(&id) {
+                ids.push(id);
             }
         }
         let mut headers = vec!["Scenario / task".to_string()];
-        headers.extend(agents.iter().map(|a| agent_badge(a).2.to_string()));
+        headers.extend(agents.iter().map(|a| Badge::for_agent(a).name.to_string()));
         let rows: Vec<Vec<String>> = ids
-            .iter()
-            .map(|(id, _)| {
-                let mut row = vec![id.clone()];
+            .into_iter()
+            .map(|id| {
+                let mut row = Vec::with_capacity(agents.len() + 1);
                 for a in &agents {
-                    let cell = self.results.iter().rfind(|r| &r.id == id && &r.agent == a).map(|r| {
-                        let mark = match r.status {
-                            Status::Pass => "PASS",
-                            Status::Fail => "FAIL",
-                            Status::Skip => "skip",
-                            Status::Blocked => "blocked",
-                        };
-                        if r.status == Status::Pass { format!("{mark} {:.0}s", r.elapsed_s) } else { format!("{mark} {}", short(&r.reason, 60)) }
-                    });
-                    row.push(cell.unwrap_or_default());
+                    row.push(self.cells.get(&(id.clone(), a.clone())).cloned().unwrap_or_default());
                 }
+                row.insert(0, id);
                 row
             })
             .collect();
@@ -157,7 +170,6 @@ impl HarnessPanel {
             *t.delegate_mut() = matrix;
             t.refresh(cx);
         });
-        let report = Report::new("live", "acp", self.results.clone());
         let board: Vec<Vec<String>> = report
             .leaderboard()
             .iter()
@@ -165,10 +177,10 @@ impl HarnessPanel {
             .map(|(i, r)| {
                 vec![
                     format!("#{}", i + 1),
-                    agent_badge(&r.agent).2.to_string(),
+                    Badge::for_agent(&r.agent).name.to_string(),
                     format!("{}/{} ({:.0}%)", r.passed, r.runs, r.pass_rate),
                     format!("{:.0}s", r.median_time_s),
-                    crate::panels::agents::fmt_tokens(r.tokens),
+                    fmt_tokens(r.tokens),
                     r.cost_usd.map(|c| format!("${c:.2}")).unwrap_or_else(|| "—".into()),
                     format!("{:.1}", r.score),
                 ]
@@ -196,7 +208,8 @@ impl HarnessPanel {
         }
         self.running = Some(kind);
         self.total = n;
-        self.results.retain(|r| r.kind != kind);
+        let kept = std::mem::take(&mut self.results).into_iter().filter(|r| r.kind != kind).collect();
+        self.set_results(kept);
         self.current = None;
         let (tx, rx) = async_channel::unbounded::<Progress>();
         runtime::tokio().spawn(async move {
@@ -246,6 +259,7 @@ impl HarnessPanel {
         match msg {
             Progress::Started(label) => self.current = Some(label),
             Progress::Result(r) => {
+                self.cells.insert((r.id.clone(), r.agent.clone()), cell(&r));
                 self.results.push(r);
                 self.refresh_tables(cx);
             }
@@ -254,7 +268,7 @@ impl HarnessPanel {
                 self.current = None;
                 match r {
                     Ok((report, dir)) => {
-                        self.results = report.results.clone();
+                        self.set_results(report.results.clone());
                         self.set_report(report, dir, cx);
                     }
                     Err(e) => self.load_error = Some(format!("report not written: {e}")),
@@ -325,9 +339,19 @@ fn toggle_set(set: &mut HashSet<String>, id: &str) {
     }
 }
 
-fn short(s: &str, n: usize) -> String {
-    let s = s.lines().next().unwrap_or("");
-    if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n).collect::<String>()) }
+/// Matrix cell: status, plus the time on a pass or the first line of the reason otherwise.
+fn cell(r: &RunResult) -> String {
+    let mark = r.status.label();
+    if r.status == Status::Pass { format!("{mark} {:.0}s", r.elapsed_s) } else { format!("{mark} {}", ellipsize(r.reason.lines().next().unwrap_or(""), 60)) }
+}
+
+/// The newest `harness/reports/<dir>/report.json`.
+fn latest_report(h: &Path) -> Option<(Report, PathBuf)> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(h.join("reports")).ok()?.flatten().map(|d| d.path()).filter(|p| p.join("report.json").is_file()).collect();
+    dirs.sort();
+    let dir = dirs.pop()?;
+    let r = serde_json::from_str::<Report>(&std::fs::read_to_string(dir.join("report.json")).ok()?).ok()?;
+    Some((r, dir))
 }
 
 impl Render for HarnessPanel {
@@ -347,7 +371,7 @@ impl Render for HarnessPanel {
         };
         let agent_chips = self.chips(
             "h-agent",
-            self.agents.iter().map(|a| (a.to_string(), agent_badge(a).2.to_string(), self.selected_agents.contains(a))).collect::<Vec<_>>().into_iter(),
+            self.agents.iter().map(|a| (a.to_string(), Badge::for_agent(a).name.to_string(), self.selected_agents.contains(a))).collect::<Vec<_>>().into_iter(),
             &p,
             cx,
             |this, id| {
@@ -376,7 +400,7 @@ impl Render for HarnessPanel {
         let progress = self.running.map(|k| {
             format!("{} {}/{} · {}", if k == RunKind::Conformance { "Conformance" } else { "Bench" }, done.min(self.total), self.total, self.current.clone().unwrap_or_default())
         });
-        let report_md = self.report.as_ref().map(|r| r.to_markdown());
+        let has_report = self.report.is_some();
         let dir = self.report_dir.clone();
         let label_row = |label: &str, chips: Vec<AnyElement>| {
             h_flex().gap(px(6.)).flex_wrap().child(div().w(px(76.)).flex_none().text_size(px(11.)).text_color(p.muted).child(label.to_string())).children(chips)
@@ -408,11 +432,11 @@ impl Render for HarnessPanel {
                             .on_click(cx.listener(|this, _, _, cx| this.run(RunKind::Conformance, cx))),
                     )
                     .child(Button::new("run-bench").small().loading(self.running == Some(RunKind::Bench)).disabled(running).label("Run bench…").on_click(cx.listener(|this, _, window, cx| this.confirm_bench(window, cx))))
-                    .child(Button::new("copy-md").small().ghost().label("Copy markdown").disabled(report_md.is_none()).on_click(move |_, _, cx| {
-                        if let Some(md) = &report_md {
-                            cx.write_to_clipboard(ClipboardItem::new_string(md.clone()));
+                    .child(Button::new("copy-md").small().ghost().label("Copy markdown").disabled(!has_report).on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(r) = &this.report {
+                            cx.write_to_clipboard(ClipboardItem::new_string(r.to_markdown()));
                         }
-                    }))
+                    })))
                     .child(Button::new("open-reports").small().ghost().label("Open report folder").disabled(dir.is_none()).on_click(move |_, _, _| {
                         if let Some(d) = &dir {
                             let _ = std::process::Command::new("open").arg(d).spawn();

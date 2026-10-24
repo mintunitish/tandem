@@ -3,10 +3,14 @@
 //! spawning, replay logs) lives in `crate::tasks`.
 
 use chrono::{DateTime, Utc};
+use gpui_kit::SharedString;
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tandem_core::{
-    AgentEvent, AgentId, DiffSet, PermissionRequest, RequestId, RiskClass, Role, StopReason, TaskEvent, TaskId, TaskPhase, ToolCall,
+    AgentDescriptor, AgentEvent, AgentId, DiffSet, RequestId, RiskClass, Role, StopReason, TaskEvent, TaskId, TaskPhase, ToolCall, ToolCallId,
     Usage,
 };
 use tandem_quota::PoolState;
@@ -66,6 +70,15 @@ pub struct AgentTask {
     pub deciding: Vec<RequestId>,
     /// Setup notes shown above the transcript (skills, attached databases).
     pub notes: Vec<String>,
+    /// Merged state of every tool call (initial call + its updates), kept by [`AgentsModel::apply`].
+    tools: HashMap<ToolCallId, ToolCall>,
+    /// Permission requests that got a `PermissionResolved`.
+    resolved: HashSet<RequestId>,
+    /// Non-safe permission requests still waiting for a decision.
+    pending: HashSet<RequestId>,
+    /// Rendered text per event (text deltas only), built on first use and reset when a delta
+    /// grows, so the transcript does not copy every string each frame.
+    labels: Vec<OnceCell<SharedString>>,
 }
 
 impl AgentTask {
@@ -90,6 +103,10 @@ impl AgentTask {
             error: None,
             deciding: vec![],
             notes: vec![],
+            tools: HashMap::new(),
+            resolved: HashSet::new(),
+            pending: HashSet::new(),
+            labels: vec![],
         }
     }
 
@@ -108,45 +125,58 @@ impl AgentTask {
         }
     }
 
-    /// Permission requests still waiting for a decision (not resolved, not auto-allowed).
-    pub fn open_permissions(&self) -> Vec<&PermissionRequest> {
-        self.events
-            .iter()
-            .filter_map(|e| match e {
-                AgentEvent::PermissionRequested(r) if !self.is_resolved(&r.id) && !(r.risk == RiskClass::Safe && self.auto_allowed(r)) => Some(r),
-                _ => None,
-            })
-            .collect()
+    /// Number of permission requests still waiting for a decision (safe ones are answered by
+    /// policy inside tandem-acp and never reach a card).
+    pub fn open_permissions(&self) -> usize {
+        self.pending.len()
     }
 
     pub fn is_resolved(&self, id: &RequestId) -> bool {
-        self.events.iter().any(|e| matches!(e, AgentEvent::PermissionResolved { request, .. } if request == id))
-    }
-
-    /// Safe requests are answered by policy inside tandem-acp; they never reach a card.
-    pub fn auto_allowed(&self, r: &PermissionRequest) -> bool {
-        r.risk == RiskClass::Safe
+        self.resolved.contains(id)
     }
 
     /// Latest merged state of a tool call (initial call + its updates).
-    pub fn merged_tool(&self, id: &tandem_core::ToolCallId) -> Option<ToolCall> {
-        let mut out: Option<ToolCall> = None;
-        for e in &self.events {
-            let (AgentEvent::ToolCall(tc) | AgentEvent::ToolCallUpdate(tc)) = e else { continue };
-            if &tc.id != id {
-                continue;
-            }
-            match &mut out {
-                None => out = Some(tc.clone()),
-                Some(m) => merge_tool(m, tc),
-            }
-        }
-        out
+    pub fn merged_tool(&self, id: &ToolCallId) -> Option<&ToolCall> {
+        self.tools.get(id)
+    }
+
+    /// Display text of event `i` when it is a text delta (thoughts get their "Thinking:" prefix).
+    pub fn label(&self, i: usize) -> Option<SharedString> {
+        let AgentEvent::TextDelta { role, text } = self.events.get(i)? else { return None };
+        let cell = self.labels.get(i)?;
+        Some(
+            cell.get_or_init(|| match role {
+                Role::Thought => format!("Thinking: {}", text.trim()).into(),
+                _ => text.clone().into(),
+            })
+            .clone(),
+        )
     }
 
     pub fn tokens(&self) -> u64 {
-        let u = &self.usage;
-        u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_write_tokens
+        self.usage.total()
+    }
+
+    /// Append an event, keeping the tool / permission indexes in sync.
+    fn push(&mut self, event: AgentEvent) {
+        match &event {
+            AgentEvent::ToolCall(tc) | AgentEvent::ToolCallUpdate(tc) => match self.tools.get_mut(&tc.id) {
+                Some(m) => merge_tool(m, tc),
+                None => {
+                    self.tools.insert(tc.id.clone(), tc.clone());
+                }
+            },
+            AgentEvent::PermissionRequested(r) if r.risk != RiskClass::Safe && !self.resolved.contains(&r.id) => {
+                self.pending.insert(r.id.clone());
+            }
+            AgentEvent::PermissionResolved { request, .. } => {
+                self.resolved.insert(request.clone());
+                self.pending.remove(request);
+            }
+            _ => {}
+        }
+        self.events.push(event);
+        self.labels.push(OnceCell::new());
     }
 }
 
@@ -181,25 +211,35 @@ pub fn title_from_prompt(prompt: &str) -> String {
     t
 }
 
-/// Display info per agent kind (avatar letters + color as 0xRRGGBB + display name), from
-/// the built-in descriptors' `badge` / `display_name`.
-pub fn agent_badge(agent: &AgentId) -> (&'static str, u32, &'static str) {
-    type Badge = (&'static str, u32, &'static str);
-    static BADGES: std::sync::OnceLock<std::collections::HashMap<String, Badge>> = std::sync::OnceLock::new();
-    let badges = BADGES.get_or_init(|| {
-        // Built once for the handful of built-ins; leaking gives `'static` labels.
-        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
-        let mut m: std::collections::HashMap<String, Badge> = tandem_acp::builtin()
-            .into_iter()
-            .map(|d| {
-                let color = u32::from_str_radix(&d.badge.1, 16).unwrap_or(0x868A91);
-                (d.id.0, (leak(d.badge.0), color, leak(d.display_name)))
-            })
-            .collect();
-        m.insert("fake".into(), ("F", 0x868A91, "Fake agent"));
-        m
-    });
-    badges.get(agent.as_str()).copied().unwrap_or(("?", 0x868A91, "Agent"))
+/// Avatar letters, color (0xRRGGBB) and display name of an agent.
+#[derive(Clone, Debug)]
+pub struct Badge {
+    pub letters: SharedString,
+    pub color: u32,
+    pub name: SharedString,
+}
+
+const DEFAULT_BADGE_COLOR: u32 = 0x868A91;
+
+impl Badge {
+    /// From a descriptor's `badge` / `display_name`; agents without a badge get their initial
+    /// on gray.
+    pub fn of(d: &AgentDescriptor) -> Self {
+        let name: SharedString = if d.display_name.is_empty() { d.id.to_string().into() } else { d.display_name.clone().into() };
+        let letters: SharedString = if d.badge.0.is_empty() {
+            name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into()).into()
+        } else {
+            d.badge.0.clone().into()
+        };
+        Self { letters, color: u32::from_str_radix(&d.badge.1, 16).unwrap_or(DEFAULT_BADGE_COLOR), name }
+    }
+
+    /// Built-in agents from the registry; anything else gets a default badge.
+    pub fn for_agent(agent: &AgentId) -> Self {
+        static BUILTIN: OnceLock<HashMap<String, Badge>> = OnceLock::new();
+        let builtin = BUILTIN.get_or_init(|| tandem_acp::builtin().iter().map(|d| (d.id.to_string(), Badge::of(d))).collect());
+        builtin.get(agent.as_str()).cloned().unwrap_or_else(|| Self::of(&AgentDescriptor { id: agent.clone(), ..Default::default() }))
+    }
 }
 
 #[derive(Default)]
@@ -255,6 +295,9 @@ impl AgentsModel {
                     && last_role == role
                 {
                     last.push_str(text);
+                    if let Some(l) = t.labels.last_mut() {
+                        *l = OnceCell::new();
+                    }
                     return;
                 }
             }
@@ -263,9 +306,9 @@ impl AgentsModel {
         if t.status == TaskStatus::Starting && !matches!(ev.event, AgentEvent::Done { .. } | AgentEvent::Error { .. }) {
             t.status = TaskStatus::Running;
         }
-        t.events.push(ev.event);
+        t.push(ev.event);
         // A resolved request may leave others open.
-        if t.status == TaskStatus::Running && !t.open_permissions().is_empty() {
+        if t.status == TaskStatus::Running && t.open_permissions() > 0 {
             t.status = TaskStatus::NeedsApproval;
         }
     }
@@ -282,7 +325,7 @@ impl AgentsModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tandem_core::{PermissionOption, PermissionOptionKind, ToolCallId, ToolKind, ToolStatus};
+    use tandem_core::{PermissionOption, PermissionOptionKind, PermissionRequest, ToolKind, ToolStatus};
 
     fn tool(id: &str, status: ToolStatus) -> ToolCall {
         ToolCall { id: ToolCallId::from(id), title: "Run".into(), kind: ToolKind::Execute, status, locations: vec![], raw_input: Some("rm -rf build".into()), content: None, diff: None }
@@ -308,7 +351,7 @@ mod tests {
         m.apply(ev(AgentEvent::ToolCall(tool("t", ToolStatus::Pending))));
         m.apply(ev(AgentEvent::PermissionRequested(req)));
         assert_eq!(m.tasks[0].status, TaskStatus::NeedsApproval);
-        assert_eq!(m.tasks[0].open_permissions().len(), 1);
+        assert_eq!(m.tasks[0].open_permissions(), 1);
         m.apply(ev(AgentEvent::PermissionResolved { request: RequestId::from("r1"), option: "allow".into(), by: tandem_core::Decider::User }));
         assert_eq!(m.tasks[0].status, TaskStatus::Running);
         m.apply(ev(AgentEvent::ToolCallUpdate(ToolCall { title: String::new(), ..tool("t", ToolStatus::Completed) })));

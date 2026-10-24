@@ -4,6 +4,7 @@
 
 use crate::assets::{file_icon, icon};
 use crate::editor::{EditorArea, EditorAreaEvent};
+use crate::model::project::{ProjectModel, ProjectModelEvent};
 use crate::theme::{MONO_FONT, Palette, pal};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -16,8 +17,7 @@ use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
-use tandem_core::FileDiff;
+use std::time::Duration;
 use tandem_git::{BranchInfo, Change, CommitInfo, Repo, StatusEntry};
 
 fn change_color(e: &StatusEntry, p: &Palette) -> Hsla {
@@ -33,6 +33,9 @@ fn change_color(e: &StatusEntry, p: &Palette) -> Hsla {
 fn is_staged(e: &StatusEntry) -> bool {
     !matches!(e.index, Change::Unmodified | Change::Untracked)
 }
+
+/// Status is re-read this long after the last save / filesystem change.
+const REFRESH_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Run `git <args>` in `root`, returning combined stdout+stderr and success.
 pub fn git_cli(root: &Path, args: &[&str]) -> (bool, String) {
@@ -53,27 +56,52 @@ pub struct CommitPanel {
     amend: bool,
     busy: bool,
     output: Option<String>,
-    last_refresh: Option<Instant>,
     error: Option<String>,
     editor: WeakEntity<EditorArea>,
-    _sub: Subscription,
+    refresh_task: Task<()>,
+    _subs: Vec<Subscription>,
 }
 
 impl CommitPanel {
-    pub fn new(root: PathBuf, editor: &Entity<EditorArea>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(root: PathBuf, editor: &Entity<EditorArea>, model: &Entity<ProjectModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let message = cx.new(|cx| TextareaState::new(window, cx).rows(4).placeholder("Commit Message"));
-        let sub = cx.subscribe(editor, |this: &mut Self, _, ev: &EditorAreaEvent, cx| {
-            if matches!(ev, EditorAreaEvent::Saved(_)) {
-                this.refresh(cx);
-            }
-        });
-        let mut this = Self { root, entries: vec![], message, amend: false, busy: false, output: None, last_refresh: None, error: None, editor: editor.downgrade(), _sub: sub };
+        let subs = vec![
+            cx.subscribe(editor, |this: &mut Self, _, ev: &EditorAreaEvent, cx| {
+                if matches!(ev, EditorAreaEvent::Saved(_)) {
+                    this.refresh_soon(cx);
+                }
+            }),
+            cx.subscribe(model, |this: &mut Self, _, ev: &ProjectModelEvent, cx| {
+                if matches!(ev, ProjectModelEvent::Fs(_)) {
+                    this.refresh_soon(cx);
+                }
+            }),
+        ];
+        let mut this = Self {
+            root,
+            entries: vec![],
+            message,
+            amend: false,
+            busy: false,
+            output: None,
+            error: None,
+            editor: editor.downgrade(),
+            refresh_task: Task::ready(()),
+            _subs: subs,
+        };
         this.refresh(cx);
         this
     }
 
+    /// Debounced [`refresh`](Self::refresh) for bursts of saves / watcher events.
+    fn refresh_soon(&mut self, cx: &mut Context<Self>) {
+        self.refresh_task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REFRESH_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| this.refresh(cx));
+        });
+    }
+
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.last_refresh = Some(Instant::now());
         let root = self.root.clone();
         let task = cx.background_spawn(async move { Repo::open(&root).and_then(|r| r.status()).map_err(|e| e.to_string()) });
         cx.spawn(async move |this, cx| {
@@ -96,12 +124,22 @@ impl CommitPanel {
         .detach();
     }
 
-    fn set_staged(&mut self, path: PathBuf, stage: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let res = Repo::open(&self.root).and_then(|r| if stage { r.stage(&[&path]) } else { r.unstage(&[&path]) });
-        if let Err(e) = res {
-            window.push_notification(Notification::error(e.to_string()).title("Git"), cx);
-        }
-        self.refresh(cx);
+    /// Stage / unstage `paths` off the UI thread, then refresh.
+    fn set_staged(&mut self, paths: Vec<PathBuf>, stage: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let task = cx.background_spawn(async move {
+            Repo::open(&root).and_then(|r| if stage { r.stage(&paths) } else { r.unstage(&paths) }).map_err(|e| e.to_string())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let res = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Err(e) = res {
+                    window.push_notification(Notification::error(e).title("Git"), cx);
+                }
+                this.refresh(cx);
+            });
+        })
+        .detach();
     }
 
     fn commit(&mut self, push: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -110,24 +148,33 @@ impl CommitPanel {
             window.push_notification(Notification::warning("Enter a commit message").title("Commit"), cx);
             return;
         }
-        let res = if self.amend {
-            let (ok, out) = git_cli(&self.root, &["commit", "--amend", "-m", &msg]);
-            if ok { Ok(out) } else { Err(out) }
-        } else {
-            Repo::open(&self.root).and_then(|r| r.commit(&msg)).map(|id| id.chars().take(8).collect::<String>()).map_err(|e| e.to_string())
-        };
-        match res {
-            Ok(id) => {
-                self.message.update(cx, |s, cx| s.set_value("", window, cx));
-                self.amend = false;
-                window.push_notification(Notification::success(format!("Committed {}", id.lines().next().unwrap_or(""))).title("Commit"), cx);
-                if push {
-                    self.push(cx);
-                }
+        let (root, amend) = (self.root.clone(), self.amend);
+        let task = cx.background_spawn(async move {
+            if amend {
+                let (ok, out) = git_cli(&root, &["commit", "--amend", "-m", &msg]);
+                if ok { Ok(out) } else { Err(out) }
+            } else {
+                Repo::open(&root).and_then(|r| r.commit(&msg)).map(|id| id.chars().take(8).collect::<String>()).map_err(|e| e.to_string())
             }
-            Err(e) => window.push_notification(Notification::error(e).title("Commit failed"), cx),
-        }
-        self.refresh(cx);
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let res = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match res {
+                    Ok(id) => {
+                        this.message.update(cx, |s, cx| s.set_value("", window, cx));
+                        this.amend = false;
+                        window.push_notification(Notification::success(format!("Committed {}", id.lines().next().unwrap_or(""))).title("Commit"), cx);
+                        if push {
+                            this.push(cx);
+                        }
+                    }
+                    Err(e) => window.push_notification(Notification::error(e).title("Commit failed"), cx),
+                }
+                this.refresh(cx);
+            });
+        })
+        .detach();
     }
 
     fn push(&mut self, cx: &mut Context<Self>) {
@@ -150,9 +197,6 @@ impl CommitPanel {
 
 impl Render for CommitPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.last_refresh.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
-            self.refresh(cx);
-        }
         let p = pal(cx).clone();
         let tracked: Vec<usize> = (0..self.entries.len()).filter(|i| self.entries[*i].worktree != Change::Untracked).collect();
         let untracked: Vec<usize> = (0..self.entries.len()).filter(|i| self.entries[*i].worktree == Change::Untracked).collect();
@@ -183,7 +227,7 @@ impl Render for CommitPanel {
                         .child(
                             Checkbox::new(("chg-cb", ix))
                                 .checked(is_staged(e))
-                                .on_click(cx.listener(move |this, checked: &bool, window, cx| this.set_staged(path.clone(), *checked, window, cx))),
+                                .on_click(cx.listener(move |this, checked: &bool, window, cx| this.set_staged(vec![path.clone()], *checked, window, cx))),
                         )
                         .child(icon(g, 16., gc))
                         .child(div().text_color(change_color(e, &p)).child(name))
@@ -212,10 +256,7 @@ impl Render for CommitPanel {
                     .child(crate::panels::header_icon("git-refresh", IconName::RefreshCw, &p).on_click(cx.listener(|this, _, _, cx| this.refresh(cx))))
                     .child(crate::panels::header_icon("git-stage-all", IconName::Plus, &p).on_click(cx.listener(|this, _, window, cx| {
                         let paths: Vec<PathBuf> = this.entries.iter().map(|e| e.path.clone()).collect();
-                        if let Err(e) = Repo::open(&this.root).and_then(|r| r.stage(&paths)) {
-                            window.push_notification(Notification::error(e.to_string()), cx);
-                        }
-                        this.refresh(cx);
+                        this.set_staged(paths, true, window, cx);
                     }))),
             )
             .when_some(self.error.clone(), |d, e| d.child(div().px(px(12.)).py(px(6.)).text_color(p.muted).child(e)))
@@ -274,11 +315,6 @@ impl Render for CommitPanel {
     }
 }
 
-/// Unified patch text for one `FileDiff`, as gpui-kit's `DiffFile::parse` expects.
-pub fn to_patch(fd: &FileDiff) -> String {
-    fd.to_patch()
-}
-
 pub struct GitLogPanel {
     root: PathBuf,
     commits: Vec<CommitInfo>,
@@ -334,7 +370,7 @@ impl GitLogPanel {
         cx.spawn(async move |this, cx| {
             let fds = task.await;
             let _ = this.update(cx, |p, cx| {
-                let files: Vec<DiffFile> = fds.iter().filter(|f| !f.binary).flat_map(|f| DiffFile::parse(&to_patch(f)).unwrap_or_default()).collect();
+                let files: Vec<DiffFile> = fds.iter().filter(|f| !f.binary).flat_map(|f| DiffFile::parse(&f.to_patch()).unwrap_or_default()).collect();
                 p.changed_files = fds.len();
                 p.diff = cx.new(|cx| DiffState::new(files, cx));
                 cx.notify();
@@ -453,7 +489,17 @@ fn branch_row(name: &str, current: bool, p: &Palette) -> impl IntoElement {
 pub type OnCheckout = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
 pub fn branches_dialog(root: PathBuf, on_checkout: OnCheckout, window: &mut Window, cx: &mut App) {
-    let branches = Repo::open(&root).and_then(|r| r.branches()).unwrap_or_default();
+    let r = root.clone();
+    let task = cx.background_spawn(async move { Repo::open(&r).and_then(|r| r.branches()).unwrap_or_default() });
+    window
+        .spawn(cx, async move |cx| {
+            let branches = task.await;
+            let _ = cx.update(|window, cx| open_branches(root, branches, on_checkout, window, cx));
+        })
+        .detach();
+}
+
+fn open_branches(root: PathBuf, branches: Vec<BranchInfo>, on_checkout: OnCheckout, window: &mut Window, cx: &mut App) {
     window.open_dialog(cx, move |dialog, _, cx| {
         let p = pal(cx).clone();
         let row = |b: &BranchInfo, ix: usize| {
@@ -470,20 +516,28 @@ pub fn branches_dialog(root: PathBuf, on_checkout: OnCheckout, window: &mut Wind
                 .child(div().flex_1().text_color(if b.is_head { p.text_bright } else { p.text }).child(b.name.clone()))
                 .children(b.upstream.clone().map(|u| div().text_size(px(11.)).text_color(p.muted).child(u)))
                 .on_click(move |_, window, cx| {
-                    let res = if remote {
-                        let (ok, out) = git_cli(&root, &["checkout", "--track", &name]);
-                        if ok { Ok(name.split_once('/').map(|x| x.1.to_string()).unwrap_or(name.clone())) } else { Err(out) }
-                    } else {
-                        Repo::open(&root).and_then(|r| r.checkout_branch(&name)).map(|_| name.clone()).map_err(|e| e.to_string())
-                    };
-                    match res {
-                        Ok(b) => {
-                            window.close_dialog(cx);
-                            window.push_notification(Notification::success(format!("Checked out {b}")).title("Git"), cx);
-                            cb(b, window, cx);
+                    let (root, name, cb) = (root.clone(), name.clone(), cb.clone());
+                    let task = cx.background_spawn(async move {
+                        if remote {
+                            let (ok, out) = git_cli(&root, &["checkout", "--track", &name]);
+                            if ok { Ok(name.split_once('/').map(|x| x.1.to_string()).unwrap_or(name.clone())) } else { Err(out) }
+                        } else {
+                            Repo::open(&root).and_then(|r| r.checkout_branch(&name)).map(|_| name.clone()).map_err(|e| e.to_string())
                         }
-                        Err(e) => window.push_notification(Notification::error(e).title("Checkout failed"), cx),
-                    }
+                    });
+                    window
+                        .spawn(cx, async move |cx| {
+                            let res = task.await;
+                            let _ = cx.update(|window, cx| match res {
+                                Ok(b) => {
+                                    window.close_dialog(cx);
+                                    window.push_notification(Notification::success(format!("Checked out {b}")).title("Git"), cx);
+                                    cb(b, window, cx);
+                                }
+                                Err(e) => window.push_notification(Notification::error(e).title("Checkout failed"), cx),
+                            });
+                        })
+                        .detach();
                 })
         };
         let local: Vec<_> = branches.iter().enumerate().filter(|(_, b)| !b.is_remote).map(|(i, b)| row(b, i).into_any_element()).collect();
@@ -510,13 +564,13 @@ pub fn branches_dialog(root: PathBuf, on_checkout: OnCheckout, window: &mut Wind
 mod tests {
     use super::*;
     use core::prelude::v1::test;
-    use tandem_core::FileChange;
+    use tandem_core::{FileChange, FileDiff};
 
     #[test]
     fn patch_roundtrips_through_gpui_kit_parser() {
         let hunks = tandem_git::compute_hunks("a\nb\n", "a\nc\n");
         let fd = FileDiff { path: "x.txt".into(), old_path: None, change: FileChange::Modified, old_text: None, new_text: None, hunks, binary: false };
-        let files = DiffFile::parse(&to_patch(&fd)).expect("parses");
+        let files = DiffFile::parse(&fd.to_patch()).expect("parses");
         assert_eq!(files.len(), 1);
     }
 }

@@ -5,15 +5,28 @@ use crate::theme::Palette;
 use gpui_kit::component::input::{EditorState, Position};
 use gpui_kit::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tandem_git::{GutterKind, GutterMark};
 use tandem_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
+/// Worst severity per 0-based line (0 error, 1 warning, 2 other), for the error stripe.
+pub type StripeMap = BTreeMap<u32, u8>;
+
+fn mark_color(kind: GutterKind, p: &Palette) -> Hsla {
+    match kind {
+        GutterKind::Added => p.git_added,
+        GutterKind::Modified => p.gutter_modified,
+        GutterKind::Removed => p.git_deleted,
+    }
+}
+
 pub const STRIPE_W: f32 = 10.0;
 
-/// A 3px bar at the gutter's left edge for every added/changed line, a small wedge where lines
-/// were removed. Positions are read from the editor state at paint time, so they track scrolling.
-pub fn change_marks(state: Entity<EditorState>, marks: Vec<GutterMark>, p: &Palette) -> impl IntoElement {
-    let (added, removed) = (p.git_added, p.git_deleted);
+/// A 3px bar at the gutter's left edge for every added (green) / changed (blue) line, a small
+/// wedge where lines were removed. Positions are read from the editor state at paint time, so
+/// they track scrolling.
+pub fn change_marks(state: Entity<EditorState>, marks: Arc<Vec<GutterMark>>, p: &Palette) -> impl IntoElement {
+    let p = p.clone();
     canvas(
         |_, _, _| (),
         move |bounds, _, window, cx| {
@@ -25,7 +38,7 @@ pub fn change_marks(state: Entity<EditorState>, marks: Vec<GutterMark>, p: &Pale
             let off = s.scroll_offset();
             let dm = s.display_map();
             let lines = dm.buffer_line_count();
-            for m in &marks {
+            for m in marks.iter() {
                 let line = (m.line as usize).saturating_sub(1);
                 if line > lines.max(1) || (line < lines && dm.is_buffer_line_hidden(line)) {
                     continue;
@@ -39,8 +52,7 @@ pub fn change_marks(state: Entity<EditorState>, marks: Vec<GutterMark>, p: &Pale
                     GutterKind::Removed => Bounds::new(point(bounds.left() + px(1.), y - px(2.)), size(px(6.), px(4.))),
                     _ => Bounds::new(point(bounds.left() + px(1.), y), size(px(3.), lh)),
                 };
-                let color = if m.kind == GutterKind::Removed { removed } else { added };
-                window.paint_quad(fill(quad, color));
+                window.paint_quad(fill(quad, mark_color(m.kind, &p)));
             }
         },
     )
@@ -58,14 +70,19 @@ fn severity_rank(d: &Diagnostic) -> u8 {
     }
 }
 
-/// Error stripe right of the editor: one tick per problem line (red error / amber warning) and a
-/// thin VCS tick; clicking a tick moves the caret there. The top square summarizes the file.
-pub fn error_stripe(state: Entity<EditorState>, diags: &[Diagnostic], marks: &[GutterMark], lines: usize, p: &Palette) -> impl IntoElement {
-    let mut by_line: BTreeMap<u32, u8> = BTreeMap::new();
+/// [`StripeMap`] of a file's diagnostics (computed when they change, not per frame).
+pub fn stripe_map(diags: &[Diagnostic]) -> StripeMap {
+    let mut by_line = StripeMap::new();
     for d in diags {
         let e = by_line.entry(d.range.start.line).or_insert(3);
         *e = (*e).min(severity_rank(d));
     }
+    by_line
+}
+
+/// Error stripe right of the editor: one tick per problem line (red error / amber warning) and a
+/// thin VCS tick; clicking a tick moves the caret there. The top square summarizes the file.
+pub fn error_stripe(state: Entity<EditorState>, by_line: &StripeMap, marks: &[GutterMark], lines: usize, p: &Palette) -> impl IntoElement {
     let worst = by_line.values().copied().min();
     let summary = match worst {
         Some(0) => p.error,
@@ -74,7 +91,7 @@ pub fn error_stripe(state: Entity<EditorState>, diags: &[Diagnostic], marks: &[G
         None => p.ok,
     };
     let frac = |line: u32| (line as f32 / lines.max(1) as f32).clamp(0.0, 0.995);
-    let ticks = by_line.into_iter().take(400).map(|(line, rank)| {
+    let ticks = by_line.iter().take(400).map(|(&line, &rank)| {
         let color = match rank {
             0 => p.error,
             1 => p.warning,
@@ -104,7 +121,7 @@ pub fn error_stripe(state: Entity<EditorState>, diags: &[Diagnostic], marks: &[G
             .left(px(0.))
             .w(px(2.))
             .h(px(2.))
-            .bg(if m.kind == GutterKind::Removed { p.git_deleted } else { p.git_added })
+            .bg(mark_color(m.kind, p))
     });
     div()
         .w(px(STRIPE_W))

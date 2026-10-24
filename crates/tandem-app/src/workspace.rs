@@ -4,24 +4,22 @@
 
 use crate::editor::{EditorArea, EditorAreaEvent};
 use crate::keymap::*;
-use crate::model::project::{ProjectModel, ProjectModelEvent};
-use crate::model::{self, project};
+use crate::model::project::{self, ProjectModel, ProjectModelEvent};
 use crate::panels::agents::{AgentsEvent, AgentsPanel};
 use crate::panels::database::DatabasePanel;
 use crate::panels::git::{CommitPanel, GitLogPanel};
 use crate::panels::harness::HarnessPanel;
-use crate::panels::misc::{ListPanel, ProblemsPanel, StructurePanel};
+use crate::panels::misc::{NotAvailable, ProblemsPanel, StructurePanel};
 use crate::panels::project::{ProjectEvent, ProjectPanel};
 use crate::panels::review::{ReviewEvent, ReviewPanel};
 use crate::panels::terminal::TerminalPanel;
-use crate::panels::{HideToolWindow, ToolWindow, header_icon};
+use crate::panels::{HideToolWindow, ToolWindow};
 use crate::search_everywhere::{SearchEvent, SearchPopup, SearchTab};
-use crate::state::{AppSettings, LayoutState};
+use crate::state::{AppSettings, LayoutState, SideLayout};
 use crate::statusbar::StatusBarView;
 use crate::stripes::{STRIPE_WIDTH, Side, ToolWindowId, stripe_button};
 use crate::theme::pal;
 use crate::{settings, titlebar};
-use gpui_kit::assets::IconName;
 use gpui_kit::component::dock::{DockArea, DockEvent, DockLayout, DockPlacement, DockSkin, panel_handle};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{WindowExt as _, v_flex};
@@ -32,6 +30,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const DOUBLE_SHIFT: Duration = Duration::from_millis(400);
+/// Layout changes are written to `layout.json` this long after the last one.
+const LAYOUT_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
 fn placement(side: Side) -> DockPlacement {
     match side {
@@ -59,6 +59,7 @@ pub struct Workspace {
     focus: FocusHandle,
     last_shift: Option<Instant>,
     shift_down: bool,
+    layout_save: Task<()>,
     _subs: Vec<Subscription>,
 }
 
@@ -75,52 +76,40 @@ impl Workspace {
         let branch = project::current_branch(&root).unwrap_or_else(|| "main".into());
 
         let editor = cx.new(|cx| EditorArea::new(root.clone(), settings.editor_font_size, window, cx));
-        let status = cx.new(|cx| StatusBarView::new(editor.clone(), branch.clone(), 0, cx));
-        let project = cx.new(|cx| ProjectPanel::new(root.clone(), window, cx));
         let agents = cx.new(|cx| AgentsPanel::new(root.clone(), window, cx));
+        let running = agents.read(cx).model.running_count();
+        let status = cx.new(|cx| StatusBarView::new(editor.clone(), branch.clone(), running, cx));
+        let project_model = cx.new(|cx| ProjectModel::new(root.clone(), &editor, cx));
+        let project = cx.new(|cx| ProjectPanel::new(root.clone(), &project_model, window, cx));
         let review = cx.new(|cx| ReviewPanel::new(root.clone(), cx));
         let terminal = cx.new(|cx| TerminalPanel::new(&root, cx));
-        let commit = cx.new(|cx| CommitPanel::new(root.clone(), &editor, window, cx));
+        let commit = cx.new(|cx| CommitPanel::new(root.clone(), &editor, &project_model, window, cx));
         let git_log = cx.new(|cx| GitLogPanel::new(root.clone(), cx));
-        let project_model = cx.new(|cx| ProjectModel::new(root.clone(), &editor, cx));
         let problems = cx.new(|cx| ProblemsPanel::new(&editor, cx));
         let structure = cx.new(|cx| StructurePanel::new(&editor, &project_model, cx));
         let database = cx.new(|cx| DatabasePanel::new(root.clone(), window, cx));
         let harness = cx.new(|cx| HarnessPanel::new(root.clone(), window, cx));
-        let running = agents.read(cx).model.running_count();
-        status.update(cx, |s, _| s.agents_running = running);
 
         let mut views: Vec<(ToolWindowId, AnyView)> = vec![
             (ToolWindowId::Project, project.clone().into()),
             (ToolWindowId::Commit, commit.into()),
             (ToolWindowId::Structure, structure.into()),
-            (ToolWindowId::Bookmarks, cx.new(|_| ListPanel::bookmarks()).into()),
+            (ToolWindowId::Bookmarks, cx.new(|_| NotAvailable).into()),
             (ToolWindowId::Agents, agents.clone().into()),
             (ToolWindowId::Review, review.clone().into()),
             (ToolWindowId::Database, database.into()),
-            (ToolWindowId::Notifications, cx.new(|_| ListPanel::notifications()).into()),
+            (ToolWindowId::Notifications, cx.new(|_| NotAvailable).into()),
             (ToolWindowId::Terminal, terminal.clone().into()),
-            (ToolWindowId::Run, cx.new(|_| ListPanel::run()).into()),
+            (ToolWindowId::Run, cx.new(|_| NotAvailable).into()),
             (ToolWindowId::Problems, problems.clone().into()),
             (ToolWindowId::Git, git_log.into()),
-            (ToolWindowId::Services, cx.new(|_| ListPanel::services()).into()),
+            (ToolWindowId::Services, cx.new(|_| NotAvailable).into()),
             (ToolWindowId::Harness, harness.into()),
         ];
         let mut subs = Vec::new();
         let mut tool_windows = HashMap::new();
         for (id, view) in views.drain(..) {
-            let tw = cx.new(|cx| {
-                let tw = ToolWindow::new(id, view, cx);
-                if id == ToolWindowId::Project {
-                    tw.with_header_extra(|_, cx| {
-                        header_icon("tw-locate", IconName::Locate, pal(cx))
-                            .on_click(|_, w, cx| w.dispatch_action(Box::new(SelectInProjectView), cx))
-                            .into_any_element()
-                    })
-                } else {
-                    tw
-                }
-            });
+            let tw = cx.new(|cx| ToolWindow::new(id, view, cx));
             subs.push(cx.subscribe_in(&tw, window, |this, _, ev: &HideToolWindow, window, cx| this.hide(ev.0.side(), window, cx)));
             tool_windows.insert(id, tw);
         }
@@ -130,11 +119,8 @@ impl Workspace {
         let layout = LayoutState::load();
         dock.update(cx, |d, cx| {
             d.set_center(DockLayout::tabs().panel_view(panel_handle(editor.clone()), cx), window, cx);
-            for (side, id, open, size) in [
-                (Side::Left, layout.left, layout.left_open, layout.left_size),
-                (Side::Right, layout.right, layout.right_open, layout.right_size),
-                (Side::Bottom, layout.bottom, layout.bottom_open, layout.bottom_size),
-            ] {
+            for side in Side::ALL {
+                let SideLayout { id, open, size } = *layout.side(side);
                 let pl = placement(side);
                 d.set_dock(pl, DockLayout::tabs().panel_view(panel_handle(tool_windows[&id].clone()), cx), window, cx);
                 d.set_dock_size(pl, px(size), window, cx);
@@ -148,18 +134,14 @@ impl Workspace {
             if matches!(ev, DockEvent::LayoutChanged) {
                 let d = dock.read(cx);
                 let mut l = this.layout.clone();
-                if let Some(s) = d.dock_size(DockPlacement::Left) {
-                    l.left_size = f32::from(s).round();
-                }
-                if let Some(s) = d.dock_size(DockPlacement::Right) {
-                    l.right_size = f32::from(s).round();
-                }
-                if let Some(s) = d.dock_size(DockPlacement::Bottom) {
-                    l.bottom_size = f32::from(s).round();
+                for side in Side::ALL {
+                    if let Some(s) = d.dock_size(placement(side)) {
+                        l.side_mut(side).size = f32::from(s).round();
+                    }
                 }
                 if l != this.layout {
                     this.layout = l;
-                    this.layout.save();
+                    this.save_layout(cx);
                 }
             }
         }));
@@ -177,8 +159,9 @@ impl Workspace {
             _ => {}
         }));
         subs.push(cx.subscribe_in(&project_model, window, |this, _, ev: &ProjectModelEvent, window, cx| {
-            if let ProjectModelEvent::Fs(ev) = ev {
-                this.editor.update(cx, |e, cx| e.reload_from_disk(&ev.paths, window, cx));
+            if let ProjectModelEvent::Fs(batch) = ev {
+                let paths: Vec<PathBuf> = batch.iter().flat_map(|e| e.paths.iter().cloned()).collect();
+                this.editor.update(cx, |e, cx| e.reload_from_disk(&paths, window, cx));
             }
         }));
         subs.push(cx.subscribe_in(&project, window, |this, _, ev: &ProjectEvent, window, cx| match ev {
@@ -247,6 +230,7 @@ impl Workspace {
             focus: cx.focus_handle(),
             last_shift: None,
             shift_down: false,
+            layout_save: Task::ready(()),
             _subs: subs,
         }
     }
@@ -257,19 +241,17 @@ impl Workspace {
     }
 
     pub fn is_open(&self, id: ToolWindowId) -> bool {
-        match id.side() {
-            Side::Left => self.layout.left == id && self.layout.left_open,
-            Side::Right => self.layout.right == id && self.layout.right_open,
-            Side::Bottom => self.layout.bottom == id && self.layout.bottom_open,
-        }
+        let s = self.layout.side(id.side());
+        s.id == id && s.open
     }
 
-    fn side_state(&mut self, side: Side) -> (&mut ToolWindowId, &mut bool) {
-        match side {
-            Side::Left => (&mut self.layout.left, &mut self.layout.left_open),
-            Side::Right => (&mut self.layout.right, &mut self.layout.right_open),
-            Side::Bottom => (&mut self.layout.bottom, &mut self.layout.bottom_open),
-        }
+    /// Persist the layout off the UI thread, `LAYOUT_SAVE_DEBOUNCE` after the last change.
+    fn save_layout(&mut self, cx: &mut Context<Self>) {
+        let layout = self.layout.clone();
+        self.layout_save = cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(LAYOUT_SAVE_DEBOUNCE).await;
+            cx.background_spawn(async move { layout.save() }).await;
+        });
     }
 
     /// Stripe click / ⌘N: open the tool window, or hide it when it is already showing.
@@ -285,10 +267,10 @@ impl Workspace {
         let side = id.side();
         let pl = placement(side);
         let tw = self.tool_windows[&id].clone();
-        let (cur, open) = self.side_state(side);
-        let replace = *cur != id;
-        *cur = id;
-        *open = true;
+        let s = self.layout.side_mut(side);
+        let replace = s.id != id;
+        s.id = id;
+        s.open = true;
         self.dock.update(cx, |d, cx| {
             if replace {
                 d.set_dock(pl, DockLayout::tabs().panel_view(panel_handle(tw.clone()), cx), window, cx);
@@ -307,25 +289,25 @@ impl Workspace {
             let f = tw.read(cx).focus_handle(cx);
             window.focus(&f, cx);
         }
-        self.layout.save();
+        self.save_layout(cx);
         cx.notify();
     }
 
     pub fn hide(&mut self, side: Side, window: &mut Window, cx: &mut Context<Self>) {
         let pl = placement(side);
-        *self.side_state(side).1 = false;
+        self.layout.side_mut(side).open = false;
         self.dock.update(cx, |d, cx| {
             if d.is_dock_open(pl) {
                 d.toggle_dock(pl, window, cx);
             }
         });
         self.focus_editor(window, cx);
-        self.layout.save();
+        self.save_layout(cx);
         cx.notify();
     }
 
     fn hide_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for side in [Side::Left, Side::Right, Side::Bottom] {
+        for side in Side::ALL {
             self.hide(side, window, cx);
         }
     }
@@ -590,7 +572,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, a: &crate::tasks::actions::ShowAgentBlame, window, cx| {
                 match crate::tasks::blame::lookup(&this.root, &a.path, a.line) {
                     Some(e) => {
-                        let agent = model::agents::agent_badge(&e.agent).2;
+                        let agent = this.agents.read(cx).badge(&e.agent).name;
                         toast(format!("Line {}: {agent} · task {} · “{}”", a.line, e.task, e.prompt_excerpt).into(), window, cx);
                         this.agents.update(cx, |ag, cx| ag.select_task(&e.task, cx));
                     }
@@ -605,12 +587,6 @@ impl Render for Workspace {
                     this.show(ToolWindowId::Project, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &RunConfiguration, window, cx| {
-                this.show(ToolWindowId::Run, window, cx);
-                toast("Run 'dev': run configurations arrive in phase 2".into(), window, cx);
-            }))
-            .on_action(cx.listener(|_, _: &DebugConfiguration, window, cx| toast("Debugger (DAP) is a phase 2 feature".into(), window, cx)))
-            .on_action(cx.listener(|_, _: &StopRun, window, cx| toast("Nothing is running".into(), window, cx)))
             .on_action(cx.listener(|_, a: &NotImplemented, window, cx| {
                 if a.0 == "Git Branches" {
                     return window.dispatch_action(Box::new(crate::editor::actions::ShowBranches), cx);

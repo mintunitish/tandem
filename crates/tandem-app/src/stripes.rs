@@ -3,7 +3,7 @@
 use crate::assets::icon;
 use crate::theme::pal;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, button::{Button, ButtonVariants as _}};
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,15 @@ pub enum Side {
     Left,
     Right,
     Bottom,
+}
+
+impl Side {
+    pub const ALL: [Side; 3] = [Side::Left, Side::Right, Side::Bottom];
+
+    /// Index into per-side arrays (`LayoutState::sides`).
+    pub fn index(self) -> usize {
+        self as usize
+    }
 }
 
 impl ToolWindowId {
@@ -155,9 +164,4 @@ pub fn stripe_button(
         .child(icon(id.icon(), 18., if active { color } else { p.text }))
         .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
         .on_click(on_click)
-}
-
-/// A compact ghost icon button used in tool-window headers and toolbars.
-pub fn header_button(id: impl Into<ElementId>, name: IconName, tooltip: &'static str) -> Button {
-    Button::new(id).ghost().xsmall().icon(name).tooltip(tooltip)
 }

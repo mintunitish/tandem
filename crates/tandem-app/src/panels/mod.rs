@@ -11,6 +11,7 @@ pub mod review;
 pub mod terminal;
 
 use crate::assets::icon;
+use crate::keymap::SelectInProjectView;
 use crate::stripes::ToolWindowId;
 use crate::theme::pal;
 use gpui_kit::assets::IconName;
@@ -21,24 +22,15 @@ use gpui_kit::*;
 /// Emitted when the header's hide button is pressed.
 pub struct HideToolWindow(pub ToolWindowId);
 
-type HeaderExtra = Box<dyn Fn(&mut Window, &mut App) -> AnyElement>;
-
 pub struct ToolWindow {
     pub id: ToolWindowId,
     content: AnyView,
     focus: FocusHandle,
-    /// Extra header controls (e.g. Project's "locate" button), rendered left of ⋮ —.
-    header_extra: Option<HeaderExtra>,
 }
 
 impl ToolWindow {
     pub fn new(id: ToolWindowId, content: AnyView, cx: &mut Context<Self>) -> Self {
-        Self { id, content, focus: cx.focus_handle(), header_extra: None }
-    }
-
-    pub fn with_header_extra(mut self, f: impl Fn(&mut Window, &mut App) -> AnyElement + 'static) -> Self {
-        self.header_extra = Some(Box::new(f));
-        self
+        Self { id, content, focus: cx.focus_handle() }
     }
 }
 
@@ -82,10 +74,12 @@ impl Panel for ToolWindow {
 }
 
 impl Render for ToolWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal(cx).clone();
         let id = self.id;
-        let extra = self.header_extra.as_ref().map(|f| f(window, cx));
+        // Project's "Select Opened File" button, left of ⋮ —.
+        let locate = (id == ToolWindowId::Project)
+            .then(|| header_icon("tw-locate", IconName::Locate, &p).on_click(|_, w, cx| w.dispatch_action(Box::new(SelectInProjectView), cx)));
         div()
             .id(SharedString::from(format!("tw-{}", id.panel_name())))
             .track_focus(&self.focus)
@@ -103,7 +97,7 @@ impl Render for ToolWindow {
                     .gap(px(4.))
                     .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(id.title()))
                     .child(div().flex_1())
-                    .children(extra)
+                    .children(locate)
                     .child(header_icon("tw-more", IconName::EllipsisVertical, &p))
                     .child(header_icon("tw-hide", IconName::Minus, &p).on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(HideToolWindow(id));
@@ -125,14 +119,6 @@ pub fn header_icon(id: &'static str, name: IconName, p: &crate::theme::Palette) 
         .cursor_pointer()
         .hover(|s| s.bg(p.hover))
         .child(icon(name, 16., p.muted))
-}
-
-/// A uniform list row height for tool-window lists.
-pub const ROW_H: f32 = 24.0;
-
-/// Section label used inside tool windows ("Changes  3 files").
-pub fn section_label(text: impl Into<SharedString>, p: &crate::theme::Palette) -> Div {
-    div().px(px(12.)).py(px(6.)).text_size(px(12.)).text_color(p.muted).child(text.into())
 }
 
 /// Colored pill ("Running", "Needs approval").

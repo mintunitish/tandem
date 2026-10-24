@@ -1,12 +1,6 @@
-//! Review model helpers: render a `tandem_core::FileDiff` as a unified patch for gpui-kit's
-//! `Diff`, and per-file line counts.
+//! Review model helpers: per-file line counts of a `tandem_core::FileDiff`.
 
 use tandem_core::{FileDiff, LineKind};
-
-/// Render one `FileDiff` as a git-style unified patch that `DiffFile::parse` accepts.
-pub fn to_unified_patch(f: &FileDiff) -> String {
-    f.to_patch()
-}
 
 /// (+added, −removed) line counts of one file.
 pub fn line_counts(f: &FileDiff) -> (usize, usize) {
@@ -25,7 +19,7 @@ mod tests {
     #[test]
     fn patch_has_headers_and_hunks() {
         let f = tandem_review::diff_texts("src/a.rs", Some("a\nb\n"), Some("a\nB\nc\n"));
-        let p = to_unified_patch(&f);
+        let p = f.to_patch();
         assert!(p.starts_with("diff --git a/src/a.rs b/src/a.rs"));
         assert!(p.contains("@@ -1,2 +1,3 @@"), "{p}");
         assert_eq!(line_counts(&f), (2, 1));
@@ -42,7 +36,7 @@ mod tests {
             }],
             ..f
         };
-        let p = to_unified_patch(&git_style);
+        let p = git_style.to_patch();
         assert!(p.ends_with(" a\n+b\n\\ No newline at end of file\n"), "{p:?}");
     }
 }

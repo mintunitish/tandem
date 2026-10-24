@@ -13,10 +13,12 @@ use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputSt
 use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use tandem_git::GutterMark;
 use tandem_lsp::lsp_types as lspt;
 
@@ -25,11 +27,22 @@ pub struct OpenFile {
     pub state: Entity<EditorState>,
     pub dirty: bool,
     pub language: &'static str,
-    /// Hash of the text last loaded from / written to disk.
+    /// Hash of the text last loaded from / written to disk (to skip no-op reloads).
     saved_hash: u64,
     /// Working-tree vs HEAD change marks (refreshed on open and save).
-    pub git_marks: Vec<GutterMark>,
+    pub git_marks: Arc<Vec<GutterMark>>,
+    /// Error-stripe severity per line, rebuilt when the file's diagnostics change.
+    stripe: Arc<gutter::StripeMap>,
+    /// `(line separator, indent)` for the status bar; reset by every edit.
+    format: OnceCell<(&'static str, SharedString)>,
     _subs: Vec<Subscription>,
+}
+
+impl OpenFile {
+    /// `(line separator, indent)` sniffed from the buffer, cached until the next edit.
+    pub fn format(&self, cx: &App) -> (&'static str, SharedString) {
+        self.format.get_or_init(|| crate::statusbar::detect_format(self.state.read(cx).text())).clone()
+    }
 }
 
 pub enum EditorAreaEvent {
@@ -175,16 +188,18 @@ impl EditorArea {
         }
         let path_for_sub = path.clone();
         let subs = vec![
+            // Every edit marks the buffer modified until the next save (`set_value` reloads emit
+            // no `Change`); LSP gets a rope snapshot, stringified when its debounce fires.
             cx.subscribe(&state, move |this, state, ev: &InputEvent, cx| {
                 if !matches!(ev, InputEvent::Change) {
                     return;
                 }
-                let text = state.read(cx).value();
-                this.lsp.update(cx, |hub, _| hub.change(&path_for_sub, &text));
+                let text = state.read(cx).text().clone();
+                this.lsp.update(cx, |hub, cx| hub.change(&path_for_sub, text, cx));
                 if let Some(f) = this.files.iter_mut().find(|f| f.path == path_for_sub) {
-                    let dirty = hash(&text) != f.saved_hash;
-                    if dirty != f.dirty {
-                        f.dirty = dirty;
+                    f.format = OnceCell::new();
+                    if !f.dirty {
+                        f.dirty = true;
                         cx.notify();
                     }
                 }
@@ -192,7 +207,18 @@ impl EditorArea {
             cx.observe(&state, |_, _, cx| cx.emit(EditorAreaEvent::CursorMoved)),
         ];
         let at = self.active.map(|a| a + 1).unwrap_or(self.files.len());
-        self.files.insert(at, OpenFile { path: path.clone(), state, dirty: false, language, saved_hash, git_marks: vec![], _subs: subs });
+        let file = OpenFile {
+            path: path.clone(),
+            state,
+            dirty: false,
+            language,
+            saved_hash,
+            git_marks: Arc::default(),
+            stripe: Arc::default(),
+            format: OnceCell::new(),
+            _subs: subs,
+        };
+        self.files.insert(at, file);
         self.refresh_git_marks(&path, cx);
         self.apply_diagnostics(&path, cx);
         self.activate(at, window, cx);
@@ -293,6 +319,7 @@ impl EditorArea {
                 continue;
             }
             f.saved_hash = h;
+            f.format = OnceCell::new();
             f.state.update(cx, |s, cx| s.set_value(text, window, cx));
         }
         let paths = paths.to_vec();
@@ -313,7 +340,7 @@ impl EditorArea {
             let marks = task.await;
             let _ = this.update(cx, |this, cx| {
                 if let Some(f) = this.files.iter_mut().find(|f| f.path == p) {
-                    f.git_marks = marks;
+                    f.git_marks = Arc::new(marks);
                     cx.notify();
                 }
             });
@@ -322,8 +349,9 @@ impl EditorArea {
     }
 
     fn apply_diagnostics(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(f) = self.file(path) else { return };
         let mut diags = self.lsp.read(cx).diagnostics.get(path).cloned().unwrap_or_default();
+        let Some(f) = self.files.iter_mut().find(|f| f.path == path) else { return };
+        f.stripe = Arc::new(gutter::stripe_map(&diags));
         diags.sort_by_key(|d| (d.range.start.line, d.range.start.character));
         f.state.update(cx, |s, cx| {
             let text = s.text().clone();
@@ -659,7 +687,6 @@ impl Render for EditorArea {
                     .font_family(MONO_FONT)
                     .text_size(px(self.font_size))
                     .line_height(relative(1.2));
-                let diags = self.lsp.read(cx).diagnostics.get(&f.path).cloned().unwrap_or_default();
                 let lines = f.state.read(cx).text().lines_len().max(1);
                 h_flex()
                     .size_full()
@@ -672,7 +699,7 @@ impl Render for EditorArea {
                             .child(editor)
                             .child(gutter::change_marks(f.state.clone(), f.git_marks.clone(), &p)),
                     )
-                    .child(gutter::error_stripe(f.state.clone(), &diags, &f.git_marks, lines, &p))
+                    .child(gutter::error_stripe(f.state.clone(), &f.stripe, &f.git_marks, lines, &p))
                     .into_any_element()
             }
             None => empty_state(&p).into_any_element(),

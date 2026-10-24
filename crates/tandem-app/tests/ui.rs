@@ -278,7 +278,7 @@ mod cockpit {
         agents.read_with(cx, |a, _| {
             let t = a.model.task(&id).unwrap();
             assert!(t.events.iter().any(|e| matches!(e, AgentEvent::PermissionResolved { option, by: tandem_core::Decider::User, .. } if option == "reject")));
-            let tool = t.merged_tool(&"t1".into()).unwrap();
+            let tool = t.merged_tool(&"t1".into()).cloned().unwrap();
             assert!(tool.content.unwrap_or_default().contains("permission=reject"), "the agent saw the rejection");
             assert_eq!(t.status, TaskStatus::Done);
         });
@@ -318,6 +318,8 @@ fn search_everywhere_symbols_tab_finds_function(cx: &mut TestAppContext) {
         window.input("add", cx);
     })
     .unwrap();
+    // Typing re-ranks after a short debounce.
+    cx.executor().advance_clock(std::time::Duration::from_millis(50));
     cx.run_until_parked();
 
     let (tab, names) = ws.read_with(cx, |ws, cx| {
