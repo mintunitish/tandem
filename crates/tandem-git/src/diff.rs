@@ -8,21 +8,32 @@
 use crate::{GitError, Repo, Result};
 use git2::{Delta, DiffOptions, ObjectType, Repository, Tree};
 use serde::{Deserialize, Serialize};
-use similar::{ChangeTag, DiffOp, TextDiff};
+use similar::{DiffOp, TextDiff};
 use std::path::{Path, PathBuf};
-use tandem_core::{AgentId, DiffLine, DiffSet, FileChange, FileDiff, Hunk, LineKind, TaskId};
+use tandem_core::{AgentId, DiffSet, FileChange, FileDiff, Hunk, TaskId};
 
 /// Files larger than this (either side) get no text/hunks.
 pub const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const CONTEXT: usize = 3;
+
+/// What happened to a gutter line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GutterKind {
+    /// New line.
+    Added,
+    /// Changed line (part of a replaced block).
+    Modified,
+    /// Lines deleted just before this line.
+    Removed,
+}
 
 /// Line-level change mark for the editor gutter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GutterMark {
     /// 1-based line in the current file.
     pub line: u32,
-    /// `Added` = new or changed line; `Removed` = lines deleted just before this line.
-    pub kind: LineKind,
+    pub kind: GutterKind,
 }
 
 enum Content {
@@ -73,38 +84,7 @@ fn read_workdir(root: &Path, rel: &Path) -> Result<Content> {
 
 /// Git-style hunks (3 lines of context) between two texts. Line texts keep their terminator.
 pub fn compute_hunks(old: &str, new: &str) -> Vec<Hunk> {
-    let diff = TextDiff::from_lines(old, new);
-    let mut hunks = Vec::new();
-    for group in diff.grouped_ops(CONTEXT) {
-        let (Some(first), Some(last)) = (group.first(), group.last()) else { continue };
-        let (o0, o1) = (first.old_range().start, last.old_range().end);
-        let (n0, n1) = (first.new_range().start, last.new_range().end);
-        let mut lines = Vec::new();
-        for op in &group {
-            for ch in diff.iter_changes(op) {
-                let kind = match ch.tag() {
-                    ChangeTag::Equal => LineKind::Context,
-                    ChangeTag::Delete => LineKind::Removed,
-                    ChangeTag::Insert => LineKind::Added,
-                };
-                lines.push(DiffLine {
-                    kind,
-                    old_no: ch.old_index().map(|i| i as u32 + 1),
-                    new_no: ch.new_index().map(|i| i as u32 + 1),
-                    text: ch.value().to_string(),
-                });
-            }
-        }
-        let start = |s: usize, n: usize| if n == 0 { s as u32 } else { s as u32 + 1 };
-        hunks.push(Hunk {
-            old_start: start(o0, o1 - o0),
-            old_lines: (o1 - o0) as u32,
-            new_start: start(n0, n1 - n0),
-            new_lines: (n1 - n0) as u32,
-            lines,
-        });
-    }
-    hunks
+    tandem_core::hunks_from_texts(old, new, CONTEXT, false)
 }
 
 /// Diff `tree` (None = empty) against the working tree + index of `repo`, untracked included
@@ -228,7 +208,7 @@ impl Repo {
 
     /// Gutter marks for `path` (working-tree content vs HEAD). Untracked files (and everything
     /// on an unborn branch) are all `Added`. Binary/oversized/missing files yield no marks.
-    /// Sorted by line, at most one mark per line (`Added` wins).
+    /// Sorted by line, at most one mark per line (`Added`/`Modified` win over `Removed`).
     pub fn per_line_gutter_marks(&self, path: impl AsRef<Path>) -> Result<Vec<GutterMark>> {
         let rel = self.rel(path.as_ref())?;
         let old = match self.repo.head() {
@@ -259,16 +239,21 @@ pub fn gutter_marks(old: &str, new: &str) -> Vec<GutterMark> {
         match *op {
             DiffOp::Equal { .. } => {}
             DiffOp::Delete { new_index, .. } => {
-                marks.push(GutterMark { line: new_index as u32 + 1, kind: LineKind::Removed });
+                marks.push(GutterMark { line: new_index as u32 + 1, kind: GutterKind::Removed });
             }
-            DiffOp::Insert { new_index, new_len, .. } | DiffOp::Replace { new_index, new_len, .. } => {
+            DiffOp::Insert { new_index, new_len, .. } => {
                 for l in new_index..new_index + new_len {
-                    marks.push(GutterMark { line: l as u32 + 1, kind: LineKind::Added });
+                    marks.push(GutterMark { line: l as u32 + 1, kind: GutterKind::Added });
+                }
+            }
+            DiffOp::Replace { new_index, new_len, .. } => {
+                for l in new_index..new_index + new_len {
+                    marks.push(GutterMark { line: l as u32 + 1, kind: GutterKind::Modified });
                 }
             }
         }
     }
-    marks.sort_by_key(|m| (m.line, m.kind == LineKind::Removed));
+    marks.sort_by_key(|m| (m.line, m.kind == GutterKind::Removed));
     marks.dedup_by_key(|m| m.line);
     marks
 }

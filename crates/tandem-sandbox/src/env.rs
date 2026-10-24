@@ -17,38 +17,38 @@ pub const BASE_PREFIXES: &[&str] = &["LC_", "XDG_"];
 pub const HARD_DENY: &[&str] = &["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS"];
 pub const HARD_DENY_PREFIXES: &[&str] = &["DYLD_"];
 
-/// Vendor variable allow-list for an agent: (prefixes, exact names).
-pub fn vendor_vars(agent: &AgentDescriptor) -> (Vec<&'static str>, Vec<&'static str>) {
-    let id = agent.id.as_str().to_lowercase();
-    let vendor = agent.vendor.to_lowercase();
-    let is = |k: &str, v: &str| id.contains(k) || vendor.contains(v);
-    if is("claude", "anthropic") {
-        (vec!["ANTHROPIC_", "CLAUDE_"], vec![])
-    } else if is("codex", "openai") {
-        (vec!["OPENAI_", "CODEX_"], vec![])
-    } else if is("gemini", "google") {
-        (vec!["GOOGLE_", "GEMINI_"], vec![])
-    } else if is("goose", "block") {
-        (vec!["GOOSE_"], vec![])
-    } else if is("opencode", "sst") {
-        (vec!["OPENCODE_"], vec![])
-    } else if is("copilot", "github") {
-        (vec!["COPILOT_"], vec!["GITHUB_TOKEN"])
-    } else {
-        (vec![], vec![])
-    }
+/// Vendor variable allow-list for an agent: (prefixes, exact names), from its descriptor.
+pub fn vendor_vars(agent: &AgentDescriptor) -> (&[String], &[String]) {
+    (&agent.env_prefixes, &agent.env_exact)
 }
 
-fn hard_denied(k: &str) -> bool {
+/// Code-injection variables: never passed, whatever the policy says.
+pub fn hard_denied(k: &str) -> bool {
     HARD_DENY.contains(&k) || HARD_DENY_PREFIXES.iter().any(|p| k.starts_with(p))
 }
 
 /// `env_passthrough` entries are exact names, or `PREFIX_*`.
-fn passthrough(policy: &Policy, k: &str) -> bool {
+pub fn passthrough(policy: &Policy, k: &str) -> bool {
     policy.env_passthrough.iter().any(|p| match p.strip_suffix('*') {
         Some(prefix) => !prefix.is_empty() && k.starts_with(prefix),
         None => p == k,
     })
+}
+
+/// Enclosing-agent session markers and credential-looking names.
+fn session_or_secret(k: &str) -> bool {
+    let u = k.to_uppercase();
+    u == "CLAUDECODE"
+        || u.starts_with("CLAUDE_CODE_")
+        || u == "CLAUDE_PID"
+        || ["_SECRET", "_TOKEN", "_KEY", "_PASSWORD"].iter().any(|s| u.ends_with(s))
+        || ["SECRET", "TOKEN", "PASSWORD", "PRIVATE_KEY"].iter().any(|s| u.contains(s))
+}
+
+/// The agent's own API key (`ANTHROPIC_API_KEY` for claude...), which it may inherit so
+/// API-key users can authenticate.
+fn own_api_key(k: &str, agent: &AgentDescriptor) -> bool {
+    k.ends_with("_API_KEY") && agent.env_prefixes.iter().any(|p| k.starts_with(p.as_str()))
 }
 
 /// Drop empty and relative PATH entries (`.`, `bin`): a planted `./ls` must not win.
@@ -56,6 +56,10 @@ fn clean_path(v: &str) -> String {
     v.split(':').filter(|e| e.starts_with('/')).collect::<Vec<_>>().join(":")
 }
 
+/// The environment an agent inherits from `parent`: base vars, its own vendor vars and
+/// `policy.env_passthrough`; then session markers (`CLAUDECODE`, `CLAUDE_CODE_*`) and
+/// `*_SECRET` / `*_TOKEN` / `*_KEY` names are removed unless passed through explicitly (the
+/// agent's own `<VENDOR>_API_KEY` survives); finally the descriptor's `env` is applied.
 pub fn scrub(parent: &HashMap<String, String>, policy: &Policy, agent: &AgentDescriptor) -> BTreeMap<String, String> {
     let (prefixes, exact) = vendor_vars(agent);
     let mut out = BTreeMap::new();
@@ -63,11 +67,11 @@ pub fn scrub(parent: &HashMap<String, String>, policy: &Policy, agent: &AgentDes
         if hard_denied(k) || k.is_empty() || k.contains('=') || k.contains('\0') || v.contains('\0') {
             continue;
         }
-        let keep = BASE_VARS.contains(&k.as_str())
+        let allowed = BASE_VARS.contains(&k.as_str())
             || BASE_PREFIXES.iter().any(|p| k.starts_with(p))
-            || prefixes.iter().any(|p| k.starts_with(p))
-            || exact.contains(&k.as_str())
-            || passthrough(policy, k);
+            || prefixes.iter().any(|p| k.starts_with(p.as_str()))
+            || exact.iter().any(|e| e == k);
+        let keep = passthrough(policy, k) || (allowed && (own_api_key(k, agent) || !session_or_secret(k)));
         if keep {
             let v = if k == "PATH" { clean_path(v) } else { v.clone() };
             out.insert(k.clone(), v);
@@ -91,18 +95,19 @@ pub fn apply(cmd: &mut std::process::Command, env: &BTreeMap<String, String>) {
 mod tests {
     use super::*;
 
+    /// Mirrors the vendor allow-lists `tandem_acp::registry` fills in.
     fn agent(id: &str) -> AgentDescriptor {
-        AgentDescriptor {
-            id: id.into(),
-            display_name: id.into(),
-            vendor: String::new(),
-            command: id.into(),
-            args: vec![],
-            env: BTreeMap::new(),
-            install_hint: String::new(),
-            acp: true,
-            auth_note: String::new(),
-        }
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (env_prefixes, env_exact) = match id {
+            "claude" => (v(&["ANTHROPIC_", "CLAUDE_"]), vec![]),
+            "codex" => (v(&["OPENAI_", "CODEX_"]), vec![]),
+            "gemini" => (v(&["GOOGLE_", "GEMINI_"]), vec![]),
+            "goose" => (v(&["GOOSE_"]), vec![]),
+            "opencode" => (v(&["OPENCODE_"]), vec![]),
+            "copilot" => (v(&["COPILOT_"]), v(&["GITHUB_TOKEN"])),
+            _ => (vec![], vec![]),
+        };
+        AgentDescriptor { id: id.into(), display_name: id.into(), command: id.into(), acp: true, env_prefixes, env_exact, ..Default::default() }
     }
 
     fn parent() -> HashMap<String, String> {
@@ -146,10 +151,11 @@ mod tests {
     #[test]
     fn claude_gets_only_its_vars() {
         let e = scrub(&parent(), &Policy::default(), &agent("claude"));
-        for k in ["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "XDG_CONFIG_HOME", "ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK"] {
+        for k in ["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "XDG_CONFIG_HOME", "ANTHROPIC_API_KEY"] {
             assert!(e.contains_key(k), "missing {k}");
         }
-        for k in ["OPENAI_API_KEY", "GOOGLE_API_KEY", "GITHUB_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "STRIPE_SECRET", "MY_API_KEY", "NPM_TOKEN", "SSH_AUTH_SOCK", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "BASH_ENV", "CUSTOM_ALLOWED"] {
+        // Session markers of an enclosing Claude Code are dropped even for claude.
+        for k in ["CLAUDE_CODE_USE_BEDROCK", "OPENAI_API_KEY", "GOOGLE_API_KEY", "GITHUB_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "STRIPE_SECRET", "MY_API_KEY", "NPM_TOKEN", "SSH_AUTH_SOCK", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "BASH_ENV", "CUSTOM_ALLOWED"] {
             assert!(!e.contains_key(k), "leaked {k}");
         }
         assert_eq!(e["PATH"], "/usr/bin:/opt/homebrew/bin");
@@ -166,8 +172,12 @@ mod tests {
         assert!(goose.contains_key("GOOSE_PROVIDER") && !goose.contains_key("OPENAI_API_KEY"));
         let oc = scrub(&p, &Policy::default(), &agent("opencode"));
         assert!(oc.contains_key("OPENCODE_CONFIG") && !oc.contains_key("GITHUB_TOKEN"));
+        // `GITHUB_TOKEN` is on copilot's allow-list but credential-looking names still need
+        // an explicit `env_passthrough`.
         let cp = scrub(&p, &Policy::default(), &agent("copilot"));
-        assert!(cp.contains_key("GITHUB_TOKEN"));
+        assert!(!cp.contains_key("GITHUB_TOKEN"));
+        let pol = Policy { env_passthrough: vec!["GITHUB_TOKEN".into()], ..Policy::default() };
+        assert!(scrub(&p, &pol, &agent("copilot")).contains_key("GITHUB_TOKEN"));
         let unknown = scrub(&p, &Policy::default(), &agent("mystery"));
         assert!(!unknown.contains_key("GITHUB_TOKEN") && !unknown.contains_key("OPENAI_API_KEY"));
         assert!(!scrub(&p, &Policy::default(), &agent("claude")).contains_key("GITHUB_TOKEN"));

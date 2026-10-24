@@ -1,7 +1,7 @@
 //! Goose: `~/.local/share/goose/sessions/sessions.db` per-session token columns, opened
 //! read-only. Quota belongs to the upstream provider → status Unknown, tokens only.
 
-use crate::model::{QuotaSnapshot, Source, Unit, Window, WindowKind};
+use crate::model::{Source, Unit, Window, WindowKind};
 use crate::provider::{ProviderCore, QuotaProvider};
 use crate::safe_fs;
 use anyhow::Result;
@@ -9,12 +9,12 @@ use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use futures::future::BoxFuture;
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
-use tandem_core::{AgentEvent, AgentId, Receiver};
+use tandem_core::AgentEvent;
 
 pub const AGENT: &str = "goose";
 
 pub fn default_db_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".local/share/goose/sessions/sessions.db"))
+    Some(tandem_core::fs::home().join(".local/share/goose/sessions/sessions.db"))
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -72,14 +72,8 @@ impl GooseProvider {
 }
 
 impl QuotaProvider for GooseProvider {
-    fn agent(&self) -> AgentId {
-        self.core.agent()
-    }
-    fn snapshot(&self) -> BoxFuture<'_, QuotaSnapshot> {
-        Box::pin(async move { self.core.current() })
-    }
-    fn subscribe(&self) -> Receiver<QuotaSnapshot> {
-        self.core.subscribe()
+    fn core(&self) -> &ProviderCore {
+        &self.core
     }
     fn reconcile(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move { self.refresh() })

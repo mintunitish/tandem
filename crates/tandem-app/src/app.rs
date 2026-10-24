@@ -184,7 +184,7 @@ fn default_project() -> PathBuf {
         let p = PathBuf::from(s.trim());
         if p.is_dir() { return p; }
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    let home = tandem_core::fs::home();
     match std::env::current_dir() {
         Ok(cwd) if cwd != std::path::Path::new("/") && cwd != home => cwd,
         _ => home,

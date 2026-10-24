@@ -5,8 +5,7 @@
 
 use crate::fuzzy::{Query, Scratch, score_name};
 use crate::watcher::{FsEvent, FsEventKind};
-use crate::{is_excluded_name, is_excluded_path};
-use ignore::WalkBuilder;
+use crate::is_excluded_path;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -480,10 +479,7 @@ impl SymbolIndex {
 }
 
 fn scan(dir: &Path) -> HashMap<PathBuf, Vec<Symbol>> {
-    let mut wb = WalkBuilder::new(dir);
-    wb.hidden(false).require_git(false).git_global(false);
-    wb.filter_entry(|e| e.depth() == 0 || e.file_name().to_str().is_none_or(|n| !is_excluded_name(n)));
-    let paths: Vec<PathBuf> = wb
+    let paths: Vec<PathBuf> = crate::walker(dir)
         .build()
         .flatten()
         .filter(|d| d.file_type().is_some_and(|t| t.is_file()) && Lang::from_path(d.path()).is_some())

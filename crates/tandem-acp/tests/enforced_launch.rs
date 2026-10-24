@@ -18,6 +18,7 @@ fn fake() -> AgentDescriptor {
         install_hint: String::new(),
         acp: true,
         auth_note: String::new(),
+        ..Default::default()
     }
 }
 
@@ -128,7 +129,7 @@ async fn start(sandbox: bool) -> (tandem_acp::AgentHandle, EventRx, tempfile::Te
     let mut opts = SpawnOptions::new(dir.path(), dir.path(), Policy::default());
     opts.sandbox = sandbox;
     let (tx, rx) = tandem_core::unbounded();
-    let h = AcpAgent::spawn_opts(&fake(), opts, tx, TaskId::new())
+    let h = AcpAgent::spawn(&fake(), opts, tx, TaskId::new())
         .await
         .expect("spawn");
     assert!(matches!(next(&rx).await, AgentEvent::SessionStarted { .. }));
@@ -140,6 +141,7 @@ async fn safe_is_auto_allowed_by_policy() {
     let (h, rx, _dir) = start(false).await;
     let prompt = h.prompt("safe-read".into());
     let drive = async {
+        assert!(matches!(next(&rx).await, AgentEvent::TextDelta { role: tandem_core::Role::User, .. }));
         assert!(matches!(next(&rx).await, AgentEvent::ToolCall(_)));
         let AgentEvent::PermissionRequested(p) = next(&rx).await else { panic!("permission") };
         assert_eq!(p.risk, RiskClass::Safe, "{}", p.reason);

@@ -181,21 +181,25 @@ pub fn title_from_prompt(prompt: &str) -> String {
     t
 }
 
-/// Display info per agent kind (avatar letter + color as 0xRRGGBB + display name).
+/// Display info per agent kind (avatar letters + color as 0xRRGGBB + display name), from
+/// the built-in descriptors' `badge` / `display_name`.
 pub fn agent_badge(agent: &AgentId) -> (&'static str, u32, &'static str) {
-    match agent.as_str() {
-        "claude" => ("C", 0xD97757, "Claude Code"),
-        "codex" => ("X", 0x10A37F, "Codex"),
-        "gemini" => ("G", 0x4285F4, "Gemini CLI"),
-        "opencode" => ("O", 0xC77DBB, "OpenCode"),
-        "goose" => ("Gs", 0xF2C55C, "Goose"),
-        "kiro" => ("K", 0x9046FF, "Kiro CLI"),
-        "cline" => ("Cl", 0x5B8DEF, "Cline"),
-        "copilot" => ("Co", 0x8957E5, "Copilot CLI"),
-        "qwen" => ("Q", 0x615CED, "Qwen Code"),
-        "fake" => ("F", 0x868A91, "Fake agent"),
-        _ => ("?", 0x868A91, "Agent"),
-    }
+    type Badge = (&'static str, u32, &'static str);
+    static BADGES: std::sync::OnceLock<std::collections::HashMap<String, Badge>> = std::sync::OnceLock::new();
+    let badges = BADGES.get_or_init(|| {
+        // Built once for the handful of built-ins; leaking gives `'static` labels.
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        let mut m: std::collections::HashMap<String, Badge> = tandem_acp::builtin()
+            .into_iter()
+            .map(|d| {
+                let color = u32::from_str_radix(&d.badge.1, 16).unwrap_or(0x868A91);
+                (d.id.0, (leak(d.badge.0), color, leak(d.display_name)))
+            })
+            .collect();
+        m.insert("fake".into(), ("F", 0x868A91, "Fake agent"));
+        m
+    });
+    badges.get(agent.as_str()).copied().unwrap_or(("?", 0x868A91, "Agent"))
 }
 
 #[derive(Default)]

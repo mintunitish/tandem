@@ -1,6 +1,5 @@
 //! Find in Files / Replace in Files, powered by the ripgrep crates over `ignore::WalkParallel`.
 
-use crate::is_excluded_name;
 use anyhow::{Context, Result, bail};
 use grep::matcher::Matcher;
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
@@ -81,9 +80,7 @@ fn build_matcher(query: &str, opts: &SearchOptions) -> Result<RegexMatcher> {
 }
 
 fn build_walker(root: &Path, opts: &SearchOptions) -> Result<WalkBuilder> {
-    let mut wb = WalkBuilder::new(root);
-    wb.hidden(false).require_git(false).git_global(false).follow_links(false);
-    wb.filter_entry(|e| e.depth() == 0 || e.file_name().to_str().is_none_or(|n| !is_excluded_name(n)));
+    let mut wb = crate::walker(root);
     if !opts.include_glob.is_empty() || !opts.exclude_glob.is_empty() {
         let mut ob = OverrideBuilder::new(root);
         for g in &opts.include_glob {
@@ -274,11 +271,12 @@ pub fn apply_replacements(items: &[ReplaceItem]) -> Result<ReplaceReport> {
             changed += 1;
         }
         if changed > 0 {
-            let tmp = path.with_extension("tandem-tmp");
-            std::fs::write(&tmp, lines.concat())?;
-            let perms = std::fs::metadata(path)?.permissions();
-            std::fs::set_permissions(&tmp, perms)?;
-            std::fs::rename(&tmp, path)?;
+            let meta = std::fs::metadata(path)?;
+            #[cfg(unix)]
+            let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o7777;
+            #[cfg(not(unix))]
+            let mode = { let _ = meta; 0o644 };
+            tandem_core::fs::atomic_write_mode(path, lines.concat().as_bytes(), mode)?;
             report.files_changed += 1;
             report.lines_changed += changed;
         }

@@ -1,10 +1,10 @@
 use chrono::{Duration, TimeZone, Utc};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tandem_core::{AgentEvent, Direction, StopReason, Usage};
-use tandem_quota::providers::{acp, claude, claude_logs, codex, codex_logs, gemini, goose};
+use tandem_quota::providers::{self, acp, claude, claude_logs, codex, codex_logs, gemini, goose};
 use tandem_quota::*;
 
 fn fixture(name: &str) -> PathBuf {
@@ -88,11 +88,12 @@ async fn codex_fake_app_server() {
         args: vec![fixture("fake_app_server.js").to_string_lossy().into_owned()],
         sessions_dir: None,
         request_timeout: StdDuration::from_secs(5),
+        offline: false,
     };
     let p = codex::CodexProvider::new(opts);
     let rx = p.subscribe();
     p.start().await.expect("start against fake app-server");
-    let s = p.snapshot().await;
+    let s = p.snapshot();
     assert_eq!(s.plan.as_deref(), Some("pro"));
     let five = s.window("5h").unwrap();
     assert_eq!((five.used, five.source), (Some(25.0), Source::AgentRpc));
@@ -106,8 +107,8 @@ async fn codex_fake_app_server() {
     assert_eq!(s.window("session").unwrap().used, Some(390.0));
     // Reconcile re-reads.
     p.reconcile().await;
-    assert_eq!(p.snapshot().await.window("5h").unwrap().used, Some(40.0));
-    assert_eq!(p.snapshot().await.error, None);
+    assert_eq!(p.snapshot().window("5h").unwrap().used, Some(40.0));
+    assert_eq!(p.snapshot().error, None);
 }
 
 #[tokio::test]
@@ -115,7 +116,7 @@ async fn codex_missing_binary_records_error() {
     let opts = codex::CodexOptions { program: "/nonexistent/codex".into(), sessions_dir: Some(fixture("")), ..Default::default() };
     let p = codex::CodexProvider::new(opts);
     assert!(p.start().await.is_err());
-    let s = p.snapshot().await;
+    let s = p.snapshot();
     assert!(s.error.as_deref().unwrap().contains("codex app-server"));
 }
 
@@ -125,7 +126,7 @@ async fn codex_missing_binary_records_error() {
 async fn codex_live() {
     let p = codex::CodexProvider::new(codex::CodexOptions::default());
     let r = p.start().await;
-    let s = p.snapshot().await;
+    let s = p.snapshot();
     println!("{r:?}\n{}", serde_json::to_string_pretty(&s).unwrap());
     r.unwrap();
     assert!(s.windows.iter().any(|w| w.source == Source::AgentRpc));
@@ -168,79 +169,29 @@ fn claude_rate_limit_event_statuses() {
     assert!(claude::parse_rate_limit_event(&json!({"type":"rate_limit_event"}), now).is_none());
 }
 
-#[test]
-fn claude_statusline_parsing() {
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(fixture("statusline.json")).unwrap()).unwrap();
-    let d = claude::parse_statusline(&v, Utc::now());
-    let five = d.window("5h").unwrap();
-    assert_eq!((five.used, five.used_fraction, five.source), (Some(63.0), Some(0.63), Source::AgentEvent));
-    assert_eq!(five.reset_at, Utc.timestamp_opt(1_900_000_000, 0).single());
-    assert_eq!(d.window("weekly").unwrap().reset_at, Utc.timestamp_opt(1_900_000_000, 0).single());
-    let ctx = d.window("context").unwrap();
-    assert_eq!((ctx.kind, ctx.used, ctx.limit), (WindowKind::Context, Some(25000.0), Some(200000.0)));
-    assert_eq!(d.window("session cost").unwrap().used, Some(1.5));
-    assert_eq!(derive_status(&d.windows), Status::Ok);
-}
-
-#[test]
-fn claude_statusline_settings_json() {
-    let s = claude::statusline_settings(Path::new("/opt/t/tandem-quota-sink"), Path::new("/Users/a b/.tandem/quota/sl.json"));
-    assert_eq!(s["statusLine"]["type"], "command");
-    assert_eq!(s["statusLine"]["command"], "/opt/t/tandem-quota-sink '/Users/a b/.tandem/quota/sl.json'");
-}
-
 fn claude_opts(dir: &Path) -> claude::ClaudeOptions {
-    claude::ClaudeOptions {
-        statusline_file: Some(dir.join("statusline.json")),
-        projects_dir: Some(dir.join("projects")),
-        calibration_path: Some(dir.join("calibration.json")),
-        debounce: StdDuration::from_millis(100),
-    }
+    claude::ClaudeOptions { projects_dir: Some(dir.join("projects")), calibration_path: Some(dir.join("calibration.json")), offline: false }
 }
 
 #[tokio::test]
 async fn claude_stream_ingest() {
     let dir = tempfile::tempdir().unwrap();
     let p = claude::ClaudeProvider::new(claude_opts(dir.path()));
+    // Raw lines: only `rate_limit_event` is read; stream usage arrives as typed events.
     for line in std::fs::read_to_string(fixture("claude_stream.jsonl")).unwrap().lines() {
         p.ingest_event(&raw(line));
     }
-    p.ingest_event(&AgentEvent::Usage(Usage { input_tokens: 10, ..Default::default() }));
-    let s = p.snapshot().await;
-    assert_eq!(s.window("session").unwrap().used, Some(1116.0)); // 1106 deduped + 10
+    p.ingest_event(&AgentEvent::Usage(Usage { input_tokens: 10, cost_usd: Some(0.25), context_used: Some(500), context_size: Some(1000), ..Default::default() }));
+    let s = p.snapshot();
+    assert_eq!(s.window("session").unwrap().used, Some(10.0));
     assert_eq!(s.window("session cost").unwrap().used, Some(0.25));
+    assert_eq!(s.window("context").unwrap().used_fraction, Some(0.5));
     assert_eq!(s.window("5h").unwrap().used, Some(22.0));
     assert_eq!(s.window("weekly-overage-included").unwrap().used, Some(15.0));
     assert_eq!(s.status, Status::Ok);
     let rejected = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1900000000,"rateLimitType":"five_hour"}}"#;
     p.ingest_event(&raw(rejected));
-    assert_eq!(p.snapshot().await.status, Status::Rejected);
-}
-
-#[tokio::test]
-async fn claude_statusline_sidecar_end_to_end() {
-    let dir = tempfile::tempdir().unwrap();
-    let opts = claude_opts(dir.path());
-    let out = opts.statusline_file.clone().unwrap();
-    let p = claude::ClaudeProvider::new(opts);
-    let rx = p.subscribe();
-    p.start().unwrap();
-    // Exactly what Claude Code does: run the configured command with JSON on stdin.
-    let settings = claude::statusline_settings(Path::new(env!("CARGO_BIN_EXE_tandem-quota-sink")), &out);
-    let cmd = settings["statusLine"]["command"].as_str().unwrap().to_string();
-    let run = |input: Vec<u8>| {
-        use std::io::Write;
-        let mut c = std::process::Command::new("sh").arg("-c").arg(&cmd).stdin(std::process::Stdio::piped()).spawn().unwrap();
-        c.stdin.take().unwrap().write_all(&input).unwrap();
-        assert!(c.wait().unwrap().success());
-    };
-    run(std::fs::read(fixture("statusline.json")).unwrap());
-    let s = wait_for(&rx, |s| s.window("5h").is_some()).await;
-    assert_eq!(s.window("5h").unwrap().used, Some(63.0));
-    // Garbage never clobbers the file.
-    run(b"not json".to_vec());
-    let kept: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-    assert_eq!(kept["rate_limits"]["five_hour"]["used_percentage"], 63);
+    assert_eq!(p.snapshot().status, Status::Rejected);
 }
 
 #[test]
@@ -277,7 +228,7 @@ async fn claude_heuristic_calibration() {
     write_live_transcript(dir.path(), 1000);
     let p = claude::ClaudeProvider::new(claude_opts(dir.path()));
     p.rescan_logs();
-    let s = p.snapshot().await;
+    let s = p.snapshot();
     let w = s.window("5h tokens").unwrap();
     assert_eq!((w.source, w.kind, w.used, w.used_fraction), (Source::Heuristic, WindowKind::Usage, Some(1000.0), None));
     assert!(s.window("5h").is_none());
@@ -290,7 +241,7 @@ async fn claude_heuristic_calibration() {
     write_live_transcript(dir.path(), 2000);
     let p2 = claude::ClaudeProvider::new(claude_opts(dir.path()));
     p2.rescan_logs();
-    let w = p2.snapshot().await.window("5h").cloned().unwrap();
+    let w = p2.snapshot().window("5h").cloned().unwrap();
     assert_eq!((w.source, w.kind, w.used_fraction), (Source::Heuristic, WindowKind::Quota, Some(0.5)));
 }
 
@@ -299,28 +250,41 @@ async fn claude_heuristic_calibration() {
 #[tokio::test]
 async fn acp_usage_update() {
     let p = acp::AcpGenericProvider::new("opencode".into());
-    let line = json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"usage_update","size":200000,"used":50000,"cost":{"amount":0.42,"currency":"USD"}}}});
-    p.ingest_event(&raw(&line.to_string()));
+    // tandem-acp maps `usage_update` to typed context fields and cost deltas.
+    p.ingest_event(&AgentEvent::Usage(Usage { context_used: Some(50000), context_size: Some(200000), cost_usd: Some(0.40), ..Default::default() }));
+    p.ingest_event(&AgentEvent::Usage(Usage { cost_usd: Some(0.02), ..Default::default() }));
     p.ingest_event(&raw(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"}}}"#));
     p.ingest_event(&AgentEvent::Usage(Usage { input_tokens: 7, output_tokens: 3, ..Default::default() }));
-    let s = p.snapshot().await;
+    let s = p.snapshot();
     let ctx = s.window("context").unwrap();
     assert_eq!((ctx.unit, ctx.limit, ctx.used_fraction, ctx.source), (Unit::Tokens, Some(200000.0), Some(0.25), Source::AgentEvent));
-    assert_eq!(s.window("cost").unwrap().used, Some(0.42));
+    assert!((s.window("session cost").unwrap().used.unwrap() - 0.42).abs() < 1e-9);
     assert_eq!(s.window("session").unwrap().used, Some(10.0));
     assert_eq!(s.status, Status::Unknown);
 }
 
 #[tokio::test]
-async fn gemini_result_stats() {
+async fn gemini_session_usage() {
     let p = gemini::GeminiProvider::new("gemini".into());
-    let r = json!({"type":"result","status":"success","stats":{"models":{"gemini-x":{"tokens":{"prompt":100,"candidates":20,"cached":5,"total":125}}}}});
-    p.ingest_event(&raw(&r.to_string()));
+    p.ingest_event(&AgentEvent::Usage(Usage { input_tokens: 100, output_tokens: 20, cache_read_tokens: 5, ..Default::default() }));
+    p.ingest_event(&AgentEvent::Usage(Usage { input_tokens: 10, ..Default::default() }));
     p.ingest_event(&raw(r#"{"type":"result","stats":{"total_tokens":10}}"#));
-    p.ingest_event(&raw(r#"{"type":"message","role":"assistant"}"#));
-    let s = p.snapshot().await;
+    let s = p.snapshot();
     assert_eq!(s.window("session").unwrap().used, Some(135.0));
     assert_eq!(s.status, Status::Unknown);
+}
+
+#[test]
+fn for_agent_follows_quota_kind() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _g = rt.enter();
+    let desc = |id: &str, kind| tandem_core::AgentDescriptor { id: id.into(), quota_kind: kind, ..Default::default() };
+    use providers::Mode::Offline;
+    use tandem_core::QuotaKind;
+    assert_eq!(providers::for_agent(&desc("claude", QuotaKind::Claude), Offline).unwrap().agent().as_str(), "claude");
+    assert_eq!(providers::for_agent(&desc("codex", QuotaKind::Codex), Offline).unwrap().agent().as_str(), "codex");
+    assert_eq!(providers::for_agent(&desc("x", QuotaKind::AcpGeneric), Offline).unwrap().agent().as_str(), "x");
+    assert!(providers::for_agent(&desc("y", QuotaKind::None), Offline).is_none());
 }
 
 #[tokio::test]
@@ -343,7 +307,7 @@ async fn goose_sessions_db() {
     assert_eq!((t.tokens_24h, t.sessions_24h), (570, 2));
     let p = goose::GooseProvider::new(Some(db));
     p.ingest_event(&AgentEvent::Done { reason: StopReason::EndTurn });
-    let s = p.snapshot().await;
+    let s = p.snapshot();
     assert_eq!(s.window("24h tokens").unwrap().source, Source::LocalLog);
 }
 
@@ -357,7 +321,7 @@ async fn pool_aggregates_and_persists() {
         let pool = QuotaPool::with_persistence(path.clone());
         let rx = pool.subscribe();
         let acp = Arc::new(acp::AcpGenericProvider::new("opencode".into()));
-        let cl = claude::ClaudeProvider::new(claude::ClaudeOptions { statusline_file: None, projects_dir: None, calibration_path: None, ..Default::default() });
+        let cl = claude::ClaudeProvider::new(claude::ClaudeOptions { offline: true, ..Default::default() });
         pool.add(acp.clone());
         pool.add(cl.clone());
         let line = std::fs::read_to_string(fixture("claude_stream.jsonl")).unwrap();

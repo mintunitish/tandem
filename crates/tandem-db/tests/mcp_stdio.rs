@@ -201,7 +201,23 @@ async fn write_and_dangerous_gates() {
         assert_eq!(r["isError"], json!(true), "{r}");
         assert!(text_of(&r).starts_with("refused:"));
     }
-    // --allow-dangerous + TANDEM_DB_CONFIRM=<connection>: allowed.
+    // --allow-dangerous + --confirm-file: only statements whose hash the IDE approved.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let approvals = dir.path().join("approved.json");
+        std::fs::write(&approvals, serde_json::to_string(&[tandem_db::sql_hash("DELETE FROM notes")]).unwrap()).unwrap();
+        let file = approvals.to_str().unwrap();
+        let mut c = Client::spawn(&store, &["--allow-dangerous", "--confirm-file", file], &[]);
+        assert_eq!(c.call("query", json!({"sql": "DROP TABLE notes"}))["isError"], json!(true));
+        let r = c.call("query", json!({"sql": "DELETE FROM notes"}));
+        assert_ne!(r["isError"], json!(true), "{r}");
+    }
+    // TANDEM_DB_CONFIRM=<connection> without --allow-dangerous approves nothing.
+    {
+        let mut c = Client::spawn(&store, &[], &[("TANDEM_DB_CONFIRM", "fixture")]);
+        assert_eq!(c.call("query", json!({"sql": "DROP TABLE notes"}))["isError"], json!(true));
+    }
+    // --allow-dangerous + TANDEM_DB_CONFIRM=<connection>: legacy approve-all.
     {
         let mut c = Client::spawn(&store, &["--allow-dangerous"], &[("TANDEM_DB_CONFIRM", "fixture")]);
         let r = c.call("query", json!({"sql": "DROP TABLE notes"}));

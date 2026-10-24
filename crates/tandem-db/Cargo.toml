@@ -21,8 +21,8 @@ async-channel.workspace = true
 futures.workspace = true
 sqlx = { workspace = true, features = ["bigdecimal"] }
 clap.workspace = true
-dirs.workspace = true
 regex.workspace = true
+sha2 = "0.10"
 sqlparser = "0.63"
 libsqlite3-sys = "0.30"
 rmcp = { version = "3.7", features = ["server", "macros", "transport-io"] }

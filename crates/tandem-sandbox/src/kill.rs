@@ -118,6 +118,32 @@ pub fn descendant_groups(pgid: i32) -> Vec<i32> {
     groups
 }
 
+/// Stops one process group and the groups its descendants moved into: SIGTERM (+SIGCONT)
+/// now, SIGKILL whatever is still alive after `grace`. Blocks for at most `grace`.
+/// Returns the groups that were signalled.
+pub fn stop_group(pgid: i32, grace: Duration) -> Vec<i32> {
+    if pgid <= 1 {
+        return vec![];
+    }
+    // Collect descendants first: once the leader dies they are reparented and lost.
+    let mut groups = vec![pgid];
+    groups.extend(descendant_groups(pgid));
+    groups.retain(|g| signal_group(*g, libc::SIGTERM));
+    for g in &groups {
+        signal_group(*g, libc::SIGCONT);
+    }
+    let deadline = Instant::now() + grace;
+    while groups.iter().any(|g| !leader_exited(*g) && group_alive(*g)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    for g in &groups {
+        if group_alive(*g) {
+            signal_group(*g, libc::SIGKILL);
+        }
+    }
+    groups
+}
+
 impl KillSwitch {
     pub fn new() -> Self {
         Self::default()

@@ -1,6 +1,6 @@
 //! Recent Files (⌘E): a most-recent-first ring persisted at `<root>/.tandem/recent.json`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -86,16 +86,13 @@ impl RecentFiles {
     /// Write atomically (temp file + rename).
     pub fn save(&self) -> Result<()> {
         let file = self.file();
-        std::fs::create_dir_all(file.parent().context("no parent")?)?;
         let files = self
             .items
             .iter()
             .map(|p| p.strip_prefix(&self.root).unwrap_or(p).to_string_lossy().into_owned())
             .collect();
         let json = serde_json::to_string_pretty(&Disk { version: 1, files })?;
-        let tmp = file.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &file)?;
+        tandem_core::fs::atomic_write(&file, json.as_bytes())?;
         Ok(())
     }
 }

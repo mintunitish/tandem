@@ -5,8 +5,7 @@ use crate::theme::Palette;
 use gpui_kit::component::input::{EditorState, Position};
 use gpui_kit::*;
 use std::collections::BTreeMap;
-use tandem_core::diff::LineKind;
-use tandem_git::GutterMark;
+use tandem_git::{GutterKind, GutterMark};
 use tandem_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 pub const STRIPE_W: f32 = 10.0;
@@ -37,10 +36,10 @@ pub fn change_marks(state: Entity<EditorState>, marks: Vec<GutterMark>, p: &Pale
                     continue;
                 }
                 let quad = match m.kind {
-                    LineKind::Removed => Bounds::new(point(bounds.left() + px(1.), y - px(2.)), size(px(6.), px(4.))),
+                    GutterKind::Removed => Bounds::new(point(bounds.left() + px(1.), y - px(2.)), size(px(6.), px(4.))),
                     _ => Bounds::new(point(bounds.left() + px(1.), y), size(px(3.), lh)),
                 };
-                let color = if m.kind == LineKind::Removed { removed } else { added };
+                let color = if m.kind == GutterKind::Removed { removed } else { added };
                 window.paint_quad(fill(quad, color));
             }
         },
@@ -105,7 +104,7 @@ pub fn error_stripe(state: Entity<EditorState>, diags: &[Diagnostic], marks: &[G
             .left(px(0.))
             .w(px(2.))
             .h(px(2.))
-            .bg(if m.kind == LineKind::Removed { p.git_deleted } else { p.git_added })
+            .bg(if m.kind == GutterKind::Removed { p.git_deleted } else { p.git_added })
     });
     div()
         .w(px(STRIPE_W))

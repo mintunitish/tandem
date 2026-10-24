@@ -6,7 +6,6 @@
 //! (1-based; when the side is empty the start is the line *after which* the
 //! change sits). Internally everything is converted to 0-based indices.
 
-use similar::{ChangeTag, TextDiff};
 use std::path::{Path, PathBuf};
 use tandem_core::{DiffLine, FileChange, FileDiff, Hunk, LineKind};
 
@@ -21,36 +20,7 @@ pub fn diff_texts(path: impl Into<PathBuf>, old: Option<&str>, new: Option<&str>
         (Some(_), None) => FileChange::Deleted,
         _ => FileChange::Modified,
     };
-    let diff = TextDiff::from_lines(old.unwrap_or(""), new.unwrap_or(""));
-    let mut hunks = Vec::new();
-    for group in diff.grouped_ops(CONTEXT) {
-        let (Some(first), Some(last)) = (group.first(), group.last()) else { continue };
-        let (os, oe) = (first.old_range().start, last.old_range().end);
-        let (ns, ne) = (first.new_range().start, last.new_range().end);
-        let mut lines = Vec::new();
-        for op in &group {
-            for c in diff.iter_changes(op) {
-                let kind = match c.tag() {
-                    ChangeTag::Equal => LineKind::Context,
-                    ChangeTag::Delete => LineKind::Removed,
-                    ChangeTag::Insert => LineKind::Added,
-                };
-                lines.push(DiffLine {
-                    kind,
-                    old_no: c.old_index().map(|i| i as u32 + 1),
-                    new_no: c.new_index().map(|i| i as u32 + 1),
-                    text: strip_eol(c.value()).to_string(),
-                });
-            }
-        }
-        hunks.push(Hunk {
-            old_start: header_start(os, oe - os),
-            old_lines: (oe - os) as u32,
-            new_start: header_start(ns, ne - ns),
-            new_lines: (ne - ns) as u32,
-            lines,
-        });
-    }
+    let hunks = tandem_core::hunks_from_texts(old.unwrap_or(""), new.unwrap_or(""), CONTEXT, true);
     FileDiff {
         path: path.into(),
         old_path: None,
@@ -60,10 +30,6 @@ pub fn diff_texts(path: impl Into<PathBuf>, old: Option<&str>, new: Option<&str>
         hunks,
         binary: false,
     }
-}
-
-fn header_start(start0: usize, len: usize) -> u32 {
-    if len == 0 { start0 as u32 } else { start0 as u32 + 1 }
 }
 
 pub(crate) fn strip_eol(s: &str) -> &str {

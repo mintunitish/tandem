@@ -15,7 +15,7 @@ pub mod symbols;
 pub mod tree;
 pub mod watcher;
 
-pub use fuzzy::{FileIndex, FileMatch};
+pub use fuzzy::{FileIndex, FileMatch, score};
 pub use recent::RecentFiles;
 pub use search::{
     CancelToken, Match, ReplaceItem, ReplaceReport, SearchOptions, apply_replacements, find_in_files,
@@ -46,4 +46,14 @@ pub fn is_excluded_name(name: &str) -> bool {
 pub fn is_excluded_path(root: &Path, path: &Path) -> bool {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.components().any(|c| c.as_os_str().to_str().is_some_and(is_excluded_name))
+}
+
+/// The one directory walker every module uses: honours `.gitignore`/`.ignore` (even outside a
+/// git repo, not the global gitignore), includes dotfiles, never follows symlinks and skips
+/// [`is_excluded_name`] directories below `dir`.
+pub(crate) fn walker(dir: &Path) -> ignore::WalkBuilder {
+    let mut wb = ignore::WalkBuilder::new(dir);
+    wb.hidden(false).require_git(false).git_global(false).follow_links(false);
+    wb.filter_entry(|e| e.depth() == 0 || e.file_name().to_str().is_none_or(|n| !is_excluded_name(n)));
+    wb
 }

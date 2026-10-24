@@ -4,8 +4,7 @@
 //! exact name > exact stem > name prefix > camel-hump > name substring > scattered in name > path-only.
 
 use crate::watcher::{FsEvent, FsEventKind};
-use crate::{is_excluded_name, is_excluded_path};
-use ignore::WalkBuilder;
+use crate::is_excluded_path;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -166,6 +165,17 @@ fn classify(q: &[u8], name: &[u8], s: &mut Scratch) -> Option<(Tier, i32, usize)
 
 pub(crate) fn score_name(q: &[u8], name: &[u8], s: &mut Scratch) -> Option<i32> {
     classify(q, name, s).map(|t| t.1)
+}
+
+/// Fuzzy score of `query` against a free-form `candidate` (a path, symbol or action name),
+/// using the same tiers as the file finder (exact, prefix, camel humps, substring, scatter).
+/// `None` when it does not match; higher is better.
+pub fn score(query: &str, candidate: &str) -> Option<i64> {
+    let q = Query::new(query);
+    if q.is_empty() {
+        return Some(0);
+    }
+    score_path(&q, candidate.as_bytes(), &mut Scratch::default(), None).map(i64::from)
 }
 
 fn name_positions(tier: Tier, q: &[u8], name: &[u8], aux: usize, s: &mut Scratch, offset: usize, out: &mut Vec<usize>) {
@@ -356,10 +366,7 @@ impl FileIndex {
     }
 
     fn scan(&mut self, dir: &Path) {
-        let mut wb = WalkBuilder::new(dir);
-        wb.hidden(false).require_git(false).git_global(false);
-        wb.filter_entry(|e| e.depth() == 0 || e.file_name().to_str().is_none_or(|n| !is_excluded_name(n)));
-        for dent in wb.build().flatten() {
+        for dent in crate::walker(dir).build().flatten() {
             if dent.file_type().is_some_and(|t| t.is_file()) {
                 self.add(dent.path());
             }

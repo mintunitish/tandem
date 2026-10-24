@@ -1,22 +1,17 @@
 //! The agent never sees host secrets: spawn the fake agent with a canary in the parent
 //! environment and have it dump its own `std::env::vars()`.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 use tandem_acp::{AcpAgent, SpawnOptions};
 use tandem_core::{AgentDescriptor, AgentEvent, Policy, TaskId};
 
+/// The built-in claude descriptor (vendor rules: CLAUDE_* kept, CLAUDE_CODE_* must not be)
+/// running the fake agent binary.
 fn fake() -> AgentDescriptor {
     AgentDescriptor {
-        id: "claude".into(), // vendor rules for claude: CLAUDE_* kept, CLAUDE_CODE_* must not be
-        display_name: "Fake".into(),
-        vendor: "test".into(),
         command: env!("CARGO_BIN_EXE_tandem-acp-fake-agent").into(),
         args: vec![],
-        env: BTreeMap::new(),
-        install_hint: String::new(),
-        acp: true,
-        auth_note: String::new(),
+        ..tandem_acp::get("claude").unwrap()
     }
 }
 
@@ -33,7 +28,7 @@ async fn dumped_env(sandbox: bool) -> String {
     opts.sandbox = sandbox;
     opts.env_overrides.insert("TANDEM_OVERRIDE".into(), "yes".into());
     let (tx, rx) = tandem_core::unbounded();
-    let h = AcpAgent::spawn_opts(&fake(), opts, tx, TaskId::new())
+    let h = AcpAgent::spawn(&fake(), opts, tx, TaskId::new())
         .await
         .expect("spawn");
     let stop = tokio::time::timeout(Duration::from_secs(20), h.prompt("dump-env".into()))

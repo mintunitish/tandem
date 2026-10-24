@@ -736,11 +736,6 @@ impl LspClient {
 
     // ---- document sync ----
 
-    /// Text most recently sent for an open document.
-    pub fn document_text(&self, path: &Path) -> Option<String> {
-        self.inner.docs.lock().get(path).map(|d| d.text.clone())
-    }
-
     pub fn document_version(&self, path: &Path) -> Option<i32> {
         self.inner.docs.lock().get(path).map(|d| d.version)
     }
@@ -772,43 +767,6 @@ impl LspClient {
                 range_length: None,
                 text: text.to_string(),
             }],
-        };
-        self.inner.conn().notify(notif::DidChangeTextDocument::METHOD, serde_json::to_value(params)?)?;
-        drop(docs);
-        self.schedule_pull_diagnostics(path, version);
-        Ok(())
-    }
-
-    /// Incremental sync: apply `edits` (LSP ranges relative to the previous text, in
-    /// order) locally and send them as-is. Falls back to full sync if the server only
-    /// supports full sync.
-    pub fn did_change(&self, path: &Path, version: i32, edits: Vec<TextDocumentContentChangeEvent>) -> Result<()> {
-        let new_text = {
-            let docs = self.inner.docs.lock();
-            let mut text = docs.get(path).map(|d| d.text.clone()).unwrap_or_default();
-            for e in &edits {
-                match e.range {
-                    Some(r) => {
-                        let span = crate::range_to_offsets(&text, r);
-                        text.replace_range(span, &e.text);
-                    }
-                    None => text = e.text.clone(),
-                }
-            }
-            text
-        };
-        if !self.supports_incremental_sync() {
-            return self.did_change_full(path, version, &new_text);
-        }
-        let uri = path_to_uri(path)?;
-        let mut docs = self.inner.docs.lock();
-        if let Some(doc) = docs.get_mut(path) {
-            doc.version = version;
-            doc.text = new_text;
-        }
-        let params = DidChangeTextDocumentParams {
-            text_document: VersionedTextDocumentIdentifier::new(uri, version),
-            content_changes: edits,
         };
         self.inner.conn().notify(notif::DidChangeTextDocument::METHOD, serde_json::to_value(params)?)?;
         drop(docs);
@@ -859,15 +817,6 @@ impl LspClient {
                 Err(e) => tracing::debug!("pull diagnostics for {}: {e}", path.display()),
             }
         });
-    }
-
-    fn supports_incremental_sync(&self) -> bool {
-        let kind = match &self.inner.init.read().capabilities.text_document_sync {
-            Some(TextDocumentSyncCapability::Kind(k)) => Some(*k),
-            Some(TextDocumentSyncCapability::Options(o)) => o.change,
-            None => None,
-        };
-        kind == Some(TextDocumentSyncKind::INCREMENTAL)
     }
 
     fn save_includes_text(&self) -> bool {

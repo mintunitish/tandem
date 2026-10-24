@@ -1,9 +1,12 @@
-//! `tandem-db-mcp --connection <name> [--allow-write] [--allow-ddl] [--allow-dangerous]`
+//! `tandem-db-mcp --connection <name> [--allow-write] [--allow-ddl] [--allow-dangerous [--confirm-file <path>]]`
 //!
 //! Stdio MCP server for one saved connection. Logs go to stderr only.
 
 use clap::Parser;
-use tandem_db::{ConnectOptions, ConnectionStore, Db, McpPolicy, TandemDbServer};
+use tandem_db::{ConfirmFile, Confirmer, ConnectOptions, ConnectionStore, Db, DenyAll, McpPolicy, TandemDbServer};
+
+/// Legacy approve-all switch, honoured only together with `--allow-dangerous`.
+const CONFIRM_ENV: &str = "TANDEM_DB_CONFIRM";
 
 #[derive(Parser, Debug)]
 #[command(name = "tandem-db-mcp", about = "MCP server exposing a Tandem database connection (read-only by default)")]
@@ -17,9 +20,14 @@ struct Args {
     /// Allow CREATE/ALTER.
     #[arg(long)]
     allow_ddl: bool,
-    /// Allow destructive statements; also requires TANDEM_DB_CONFIRM=<connection>.
+    /// Allow destructive statements, each only once approved: its SQL hash must be listed in
+    /// `--confirm-file`, or (legacy, approve-all) TANDEM_DB_CONFIRM=<connection> must be set.
     #[arg(long)]
     allow_dangerous: bool,
+    /// JSON array of approved SQL hashes (SHA-256 of the trimmed statement) the IDE appends
+    /// to after each red-card approval.
+    #[arg(long)]
+    confirm_file: Option<std::path::PathBuf>,
     /// Override the connections file (default ~/.tandem/db/connections.json or $TANDEM_DB_STORE).
     #[arg(long, hide = true)]
     store: Option<std::path::PathBuf>,
@@ -50,10 +58,17 @@ async fn main() -> anyhow::Result<()> {
     let cfg = store
         .get(&args.connection)?
         .ok_or_else(|| anyhow::anyhow!("unknown connection '{}'", args.connection))?;
-    let policy = McpPolicy::from_flags(&cfg.name, args.allow_write, args.allow_ddl, args.allow_dangerous);
-    if args.allow_dangerous && !policy.dangerous_allowed() {
-        tracing::warn!("--allow-dangerous ignored: TANDEM_DB_CONFIRM does not match the connection name");
-    }
+    let legacy_approve_all = std::env::var(CONFIRM_ENV).is_ok_and(|v| !v.is_empty() && v == cfg.name);
+    let confirmer: Box<dyn Confirmer> = match (&args.confirm_file, legacy_approve_all) {
+        _ if !args.allow_dangerous => Box::new(DenyAll),
+        (_, true) => Box::new(|_: &str, _: &str| true),
+        (Some(f), false) => Box::new(ConfirmFile(f.clone())),
+        (None, false) => {
+            tracing::warn!("--allow-dangerous without --confirm-file (or {CONFIRM_ENV}=<connection>): every destructive statement is refused");
+            Box::new(DenyAll)
+        }
+    };
+    let policy = McpPolicy::new(args.allow_write, args.allow_ddl, args.allow_dangerous, confirmer);
     let password = store.password(&cfg)?;
     let opts = ConnectOptions { read_only: !policy.needs_writable_connection(), ..ConnectOptions::default() };
     let db = Db::connect(&cfg, password.as_ref(), opts).await?;

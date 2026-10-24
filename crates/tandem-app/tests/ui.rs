@@ -210,6 +210,7 @@ mod cockpit {
                     install_hint: String::new(),
                     acp: true,
                     auth_note: String::new(),
+                    ..Default::default()
                 },
                 cx,
             );

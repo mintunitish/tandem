@@ -33,6 +33,35 @@ pub struct PermissionRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PermissionDecision { pub request: RequestId, pub option_id: String }
 
+impl PermissionOptionKind {
+    pub fn is_allow(self) -> bool {
+        matches!(self, Self::AllowOnce | Self::AllowAlways)
+    }
+}
+
+impl PermissionRequest {
+    /// The option to pick for `kind`: that exact kind, else its sibling with the same
+    /// polarity ("once" ⇄ "always").
+    pub fn option_for(&self, kind: PermissionOptionKind) -> Option<&PermissionOption> {
+        use PermissionOptionKind::*;
+        let sibling = match kind {
+            AllowOnce => AllowAlways,
+            AllowAlways => AllowOnce,
+            RejectOnce => RejectAlways,
+            RejectAlways => RejectOnce,
+        };
+        [kind, sibling].into_iter().find_map(|k| self.options.iter().find(|o| o.kind == k))
+    }
+}
+
+/// Assigns a risk class to a permission request before the UI sees it.
+/// Implemented by `tandem_sandbox::Classifier`; the default marks everything `Review`.
+pub trait PermissionClassifier: Send + Sync {
+    fn classify(&self, _call: &ToolCall) -> (RiskClass, String) {
+        (RiskClass::Review, String::new())
+    }
+}
+
 impl std::fmt::Display for RiskClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self { RiskClass::Safe => "safe", RiskClass::Review => "review", RiskClass::Destructive => "destructive" })
@@ -53,9 +82,23 @@ pub struct Policy {
     /// Hosts agents may fetch without asking (docs sites etc.).
     #[serde(default)]
     pub fetch_allow_hosts: Vec<String>,
+    /// Launch agents in their "ask before acting" mode (see `AgentDescriptor::strict_args`).
+    #[serde(default = "default_true")]
+    pub strict_permissions: bool,
+}
+fn default_true() -> bool {
+    true
 }
 impl Default for Policy {
     fn default() -> Self {
-        Self { auto_allow_safe: true, sandbox: true, trusted_commands: vec![], protected_paths: vec![], env_passthrough: vec![], fetch_allow_hosts: vec![] }
+        Self {
+            auto_allow_safe: true,
+            sandbox: true,
+            trusted_commands: vec![],
+            protected_paths: vec![],
+            env_passthrough: vec![],
+            fetch_allow_hosts: vec![],
+            strict_permissions: true,
+        }
     }
 }

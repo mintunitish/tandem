@@ -238,46 +238,20 @@ fn scan(dir: &Path, depth: usize, budget: &mut usize, exts: &mut std::collection
     }
 }
 
-/// Locate an executable: absolute/relative paths are checked directly; bare names are
-/// searched on `PATH` plus common install dirs that GUI apps on macOS often lack.
+/// Locate an executable: paths are checked directly; bare names are searched on `PATH` plus
+/// common install dirs that GUI apps on macOS often lack.
 pub fn which(program: &str) -> Option<PathBuf> {
-    if program.contains(std::path::MAIN_SEPARATOR) {
-        let p = PathBuf::from(program);
-        return is_executable(&p).then_some(p);
-    }
-    search_dirs().into_iter().map(|d| d.join(program)).find(|p| is_executable(p))
-}
-
-fn search_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    let mut extra = vec![PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for sub in [".cargo/bin", "go/bin", ".local/bin", ".npm-global/bin", ".bun/bin", ".volta/bin"] {
-            extra.push(home.join(sub));
-        }
-    }
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let home = tandem_core::fs::home();
+    let extra = [PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")]
+        .into_iter()
+        .chain([".cargo/bin", "go/bin", ".local/bin", ".npm-global/bin", ".bun/bin", ".volta/bin"].map(|s| home.join(s)));
     for d in extra {
         if !dirs.contains(&d) {
             dirs.push(d);
         }
     }
-    dirs
-}
-
-fn is_executable(p: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(p) else { return false };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    true
+    tandem_core::fs::which_in(program, &std::env::join_paths(dirs).ok()?)
 }
 
 #[cfg(test)]

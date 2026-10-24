@@ -1,14 +1,13 @@
 //! `cargo run -p tandem-quota --example quota_demo -- --phase implement`
 //!
-//! Builds a pool from the agents' own local signals (Codex app-server, Claude logs and
-//! status-line file, Goose sessions.db), prints it with bars, and a route recommendation.
+//! Builds a pool from the installed agents' own local signals (Codex app-server, Claude
+//! logs, Goose sessions.db), prints it with bars, and a route recommendation.
 
 use chrono::Utc;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 use tandem_core::{AgentId, TaskPhase};
-use tandem_quota::providers::{claude, codex, gemini, goose};
+use tandem_quota::providers;
 use tandem_quota::*;
 
 fn bar(frac: f64, width: usize) -> String {
@@ -40,23 +39,13 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let phase = args.iter().position(|a| a == "--phase").and_then(|i| args.get(i + 1)).map(|s| parse_phase(s)).unwrap_or(TaskPhase::Any);
 
-    let pool = QuotaPool::with_default_persistence();
+    let pool = QuotaPool::new(true);
     let installed: Vec<AgentId> = ["claude", "codex", "gemini", "goose", "opencode"].into_iter().filter(|b| on_path(b)).map(AgentId::from).collect();
-
-    if on_path("codex") {
-        let p = codex::CodexProvider::new(codex::CodexOptions::default());
-        if let Err(e) = p.start().await {
-            eprintln!("codex app-server: {e:#} (using session logs)");
+    for desc in installed.iter().filter_map(|id| tandem_acp::get(id.as_str())) {
+        if let Some(p) = providers::for_agent(&desc, providers::Mode::Live) {
+            pool.add(p);
         }
-        pool.add(p);
     }
-    let c = claude::ClaudeProvider::new(claude::ClaudeOptions::default());
-    c.start()?;
-    pool.add(c);
-    let g = Arc::new(goose::GooseProvider::new(goose::default_db_path()));
-    g.refresh();
-    pool.add(g);
-    pool.add(Arc::new(gemini::GeminiProvider::new("gemini".into())));
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let st = pool.state();

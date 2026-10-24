@@ -5,7 +5,7 @@
 //! while a block is active calibrates a token ceiling per plan, stored in
 //! `~/.tandem/quota/calibration.json`; later blocks then get a fraction (Source::Heuristic).
 
-use super::{get, usage_from_json, usage_total};
+use super::{get, usage_from_json};
 use crate::model::{parse_ts, Source, Unit, Window, WindowKind};
 use crate::safe_fs;
 use chrono::{DateTime, Duration, DurationRound, Utc};
@@ -37,7 +37,7 @@ impl Block {
         self.start + BLOCK
     }
     pub fn tokens(&self) -> u64 {
-        usage_total(&self.usage)
+        self.usage.total()
     }
     pub fn is_active(&self, now: DateTime<Utc>) -> bool {
         now < self.end() && now - self.last_at < BLOCK

@@ -1,7 +1,7 @@
 //! Task orchestration: the full "start an agent task" flow from the design spec.
 //!
 //! prompt → `tandem_git` worktree `.tandem/worktrees/<id>` → `tandem_skills::materialize` →
-//! optional `tandem-db-mcp` MCP server → `AcpAgent::spawn_opts` (Seatbelt per policy, scrubbed env,
+//! optional `tandem-db-mcp` MCP server → `AcpAgent::spawn` (Seatbelt per policy, scrubbed env,
 //! tandem-sandbox classifier, Kill Switch) → events streamed to the cockpit and persisted to
 //! `.tandem/tasks/<id>/log.jsonl` → quota providers fed with every event → on `Done` the worktree
 //! diff (minus Tandem-managed skill files) goes to the Review panel.
@@ -21,7 +21,7 @@ use anyhow::{Context as _, Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tandem_acp::{AcpAgent, AgentHandle, Availability, DetectedAgent, McpServerSpec, ReplayLog, SpawnOptions};
-use tandem_core::{AgentDescriptor, AgentEvent, AgentId, DiffSet, FileDiff, Policy, Role, TaskEvent, TaskId};
+use tandem_core::{AgentDescriptor, AgentEvent, AgentId, DiffSet, FileDiff, Policy, TaskEvent, TaskId};
 use tandem_quota::QuotaPool;
 use tandem_skills::{AgentTarget, Preset, SkillId};
 
@@ -90,17 +90,15 @@ async fn run(spec: StartSpec, pool: Option<Arc<QuotaPool>>, ui: async_channel::S
     };
     ui.send(TaskMsg::Prepared { worktree: worktree.clone(), base: base.clone(), notes }).await.ok();
 
-    // 2. Replay log; the user's prompt is its first record.
-    let mut log = ReplayLog::open(task_dir(&root, &id))?;
-    let first = AgentEvent::TextDelta { role: Role::User, text: prompt.clone() };
-    let _ = log.record(&id, &first);
-    ui.send(TaskMsg::Event(Box::new(first))).await.ok();
+    // 2. Replay log. The prompt reaches it (and the UI) through the event stream:
+    //    `AgentHandle::prompt` emits it as `TextDelta { role: User }`.
+    let log = ReplayLog::open(task_dir(&root, &id))?;
 
     // 3. Spawn the agent: cwd = worktree, sandbox + classifier from policy.
     let mut opts = SpawnOptions::new(&worktree, &root, policy);
     opts.mcp_servers = mcp;
     let (tx, rx) = tandem_core::unbounded::<TaskEvent>();
-    let handle = Arc::new(AcpAgent::spawn_opts(&desc, opts, tx, id.clone()).await.with_context(|| format!("start {}", desc.display_name))?);
+    let handle = Arc::new(AcpAgent::spawn(&desc, opts, tx, id.clone()).await.with_context(|| format!("start {}", desc.display_name))?);
     ui.send(TaskMsg::Spawned(handle.clone())).await.ok();
 
     // 4. Forward events: log, quota, UI; diff after every finished turn.
@@ -130,15 +128,41 @@ fn prepare(root: &Path, id: &TaskId, presets: &[Preset]) -> Result<(PathBuf, Str
 async fn forward(
     rx: tandem_core::EventRx,
     ui: async_channel::Sender<TaskMsg>,
-    mut log: ReplayLog,
+    log: ReplayLog,
     pool: Option<Arc<QuotaPool>>,
     agent: AgentId,
     root: PathBuf,
     id: TaskId,
     base: String,
 ) {
-    while let Ok(TaskEvent { event, .. }) = rx.recv().await {
-        let _ = log.record(&id, &event);
+    // File writes run on the blocking pool; `log` travels there and back with each record.
+    let mut log = Some(log);
+    let write = async |log: &mut Option<ReplayLog>, id: &TaskId, event: Option<AgentEvent>| {
+        let (Some(mut l), id) = (log.take(), id.clone()) else { return };
+        let back = tokio::task::spawn_blocking(move || {
+            let _ = match &event {
+                Some(e) => l.record(&id, e),
+                None => l.flush(),
+            };
+            l
+        });
+        *log = back.await.ok();
+    };
+    let mut dirty = false;
+    loop {
+        // Idle stream with buffered records: flush them so the log is never far behind.
+        let next = if dirty { tokio::time::timeout(tandem_acp::log::FLUSH_INTERVAL, rx.recv()).await } else { Ok(rx.recv().await) };
+        let event = match next {
+            Ok(Ok(TaskEvent { event, .. })) => event,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                write(&mut log, &id, None).await;
+                dirty = false;
+                continue;
+            }
+        };
+        write(&mut log, &id, Some(event.clone())).await;
+        dirty = true;
         if let Some(p) = &pool {
             p.ingest(&agent, &event);
         }
@@ -227,22 +251,19 @@ pub fn detect_agents(root: &Path) -> Vec<DetectedAgent> {
     v
 }
 
-/// The vendor login command for "Sign in" (opens in a Terminal tab).
+/// The vendor login command for "Sign in" (opens in a Terminal tab): the built-in
+/// descriptor's `login_command`, else the command quoted in `auth_note`.
 pub fn login_command(agent: &AgentId, auth_note: &str) -> Option<(String, Vec<String>)> {
-    let v = |p: &str, a: &[&str]| Some((p.to_string(), a.iter().map(|s| s.to_string()).collect()));
-    match agent.as_str() {
-        "claude" => v("claude", &[]),
-        "codex" => v("codex", &["login"]),
-        "goose" => v("goose", &["configure"]),
-        "opencode" => v("opencode", &["auth", "login"]),
-        "gemini" => v("gemini", &[]),
-        _ => {
-            // auth notes look like "Kiro login (`kiro-cli login`)".
-            let cmd = auth_note.split('`').nth(1)?;
-            let mut parts = cmd.split_whitespace();
-            Some((parts.next()?.to_string(), parts.map(String::from).collect()))
-        }
+    if let Some(mut cmd) = tandem_acp::get(agent.as_str()).and_then(|d| d.login_command)
+        && !cmd.is_empty()
+    {
+        let program = cmd.remove(0);
+        return Some((program, cmd));
     }
+    // auth notes look like "Kiro login (`kiro-cli login`)".
+    let cmd = auth_note.split('`').nth(1)?;
+    let mut parts = cmd.split_whitespace();
+    Some((parts.next()?.to_string(), parts.map(String::from).collect()))
 }
 
 /// The meta tandem-review needs for conflicts / blame.

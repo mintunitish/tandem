@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use tandem_core::{FileChange, LineKind, TaskId};
-use tandem_git::{Change, GitError, Repo, apply_file, apply_hunk_to_file, copy_file_from_worktree};
+use tandem_git::{Change, GitError, GutterKind, Repo, apply_file, apply_hunk_to_file, copy_file_from_worktree};
 use tempfile::TempDir;
 
 fn init() -> (TempDir, Repo) {
@@ -105,9 +105,9 @@ fn working_tree_diff_gutter_blame() {
     assert_eq!(files[2].hunks[0].new_lines, 2);
 
     let marks = repo.per_line_gutter_marks("a.txt").unwrap();
-    assert!(marks.iter().any(|m| m.line == 5 && m.kind == LineKind::Added));
-    assert!(marks.iter().any(|m| m.line == 20 && m.kind == LineKind::Removed));
-    assert!(marks.iter().any(|m| m.line == 40 && m.kind == LineKind::Added));
+    assert!(marks.iter().any(|m| m.line == 5 && m.kind == GutterKind::Modified));
+    assert!(marks.iter().any(|m| m.line == 20 && m.kind == GutterKind::Removed));
+    assert!(marks.iter().any(|m| m.line == 40 && m.kind == GutterKind::Added));
     assert!(!marks.iter().any(|m| m.line == 10));
     let m = repo.per_line_gutter_marks("new.txt").unwrap();
     assert_eq!(m.len(), 2);

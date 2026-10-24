@@ -19,7 +19,7 @@ use gpui_kit::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tandem_db::{ColumnInfo, ConnectOptions, ConnectionConfig, ConnectionStore, Db, DbKind, McpPolicy, QueryOptions, QueryResult, Secret, SqlClass, Table};
+use tandem_db::{ColumnInfo, ConnectOptions, ConnectionConfig, ConnectionStore, Db, DbKind, QueryOptions, QueryResult, Secret, SqlClass, Table};
 
 /// Read-only grid of strings; shared by Database results and the Harness tables.
 pub struct StringTable {
@@ -367,8 +367,8 @@ impl DatabasePanel {
     /// Run `sql`; `confirm` is the connection name the user confirmed a Dangerous statement for
     /// (the IDE-side equivalent of `TANDEM_DB_CONFIRM`).
     pub fn execute(&mut self, conn: String, sql: String, class: SqlClass, confirm: Option<String>, cx: &mut Context<Self>) {
-        let policy = McpPolicy { allow_write: true, allow_ddl: true, allow_dangerous: true, dangerous_confirmed: confirm.as_deref() == Some(conn.as_str()) };
-        if let Err(why) = policy.check(class) {
+        let policy = crate::tasks::db::panel_policy(confirm.as_deref() == Some(conn.as_str()));
+        if let Err(why) = policy.check(class, &sql) {
             self.status = format!("Refused: {why}").into();
             cx.notify();
             return;

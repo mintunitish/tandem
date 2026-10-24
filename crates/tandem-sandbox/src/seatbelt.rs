@@ -18,7 +18,7 @@
 //! protected list (~/.ssh, ~/.aws, `.env*`, `*.pem`, other agents' logins, keychains...)
 //! is denied on top, so it stays unreadable even under an allowed tree.
 
-use crate::paths::{self, HOME_PROTECTED, NAME_PREFIX_PROTECTED, NAME_SUFFIX_PROTECTED, Protected};
+use crate::paths::{self, NAME_PREFIX_PROTECTED, NAME_SUFFIX_PROTECTED, Protected};
 use std::path::{Path, PathBuf};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -135,25 +135,9 @@ impl SandboxSpec {
         }
     }
 
-    /// Config dir conventionally used by a known agent id, e.g. `codex` -> `~/.codex`.
-    pub fn default_agent_home_dirs(agent_id: &str, home: &Path) -> Vec<PathBuf> {
-        let id = agent_id.to_lowercase();
-        let rel: &[&str] = if id.contains("claude") {
-            &[".claude", ".claude.json", ".config/claude"]
-        } else if id.contains("codex") {
-            &[".codex"]
-        } else if id.contains("gemini") {
-            &[".gemini"]
-        } else if id.contains("goose") {
-            &[".config/goose", ".local/share/goose", ".local/state/goose"]
-        } else if id.contains("opencode") {
-            &[".config/opencode", ".local/share/opencode", ".local/state/opencode"]
-        } else if id.contains("copilot") {
-            &[".copilot", ".config/github-copilot"]
-        } else {
-            &[]
-        };
-        rel.iter().map(|r| home.join(r)).collect()
+    /// The agent's own config dirs (`AgentDescriptor::home_dirs`) under `home`, e.g. `~/.codex`.
+    pub fn default_agent_home_dirs(agent: &tandem_core::AgentDescriptor, home: &Path) -> Vec<PathBuf> {
+        agent.home_dirs.iter().map(|r| home.join(r)).collect()
     }
 }
 
@@ -444,11 +428,6 @@ pub fn wrap_command(spec: &SandboxSpec, cmd: &str, args: &[String]) -> (String, 
     (SANDBOX_EXEC.to_string(), a)
 }
 
-/// The built-in home-relative protected list (for UI display).
-pub fn protected_home_paths() -> &'static [&'static str] {
-    HOME_PROTECTED
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,7 +446,8 @@ mod tests {
     fn profile_shape() {
         let s = SandboxSpec::new("/p", "/p/.tandem/worktrees/a", "/Users/u");
         let mut s = s;
-        s.agent_home_dirs = SandboxSpec::default_agent_home_dirs("codex", Path::new("/Users/u"));
+        let codex = tandem_core::AgentDescriptor { id: "codex".into(), home_dirs: vec![".codex".into()], ..Default::default() };
+        s.agent_home_dirs = SandboxSpec::default_agent_home_dirs(&codex, Path::new("/Users/u"));
         let p = profile(&s);
         assert!(p.starts_with("(version 1)"));
         assert!(p.contains("(deny default)"));

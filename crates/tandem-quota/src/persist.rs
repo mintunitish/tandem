@@ -1,4 +1,4 @@
-//! On-disk locations: `~/.tandem/quota/{state.json,calibration.json,statusline.json}`.
+//! On-disk locations: `$TANDEM_HOME/quota/{state.json,calibration.json}` (default `~/.tandem/quota/`).
 //! `TANDEM_QUOTA_DIR` overrides the directory (tests, portable installs).
 
 use crate::pool::PoolState;
@@ -9,17 +9,13 @@ pub fn quota_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("TANDEM_QUOTA_DIR") {
         return PathBuf::from(d);
     }
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".tandem").join("quota")
+    tandem_core::fs::tandem_home().join("quota")
 }
 pub fn state_path() -> PathBuf {
     quota_dir().join("state.json")
 }
 pub fn calibration_path() -> PathBuf {
     quota_dir().join("calibration.json")
-}
-/// Where the Claude status-line sink writes by default.
-pub fn statusline_path() -> PathBuf {
-    quota_dir().join("claude-statusline.json")
 }
 
 pub fn load_state(path: &Path) -> Option<PoolState> {

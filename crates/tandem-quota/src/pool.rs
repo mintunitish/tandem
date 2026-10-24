@@ -45,19 +45,15 @@ pub struct QuotaPool {
 }
 
 impl QuotaPool {
-    /// In-memory pool (no persistence).
-    pub fn new() -> Arc<Self> {
-        Self::build(None, PoolState::default())
+    /// Pool persisted at `$TANDEM_HOME/quota/state.json` when `persist`, else in-memory.
+    pub fn new(persist: bool) -> Arc<Self> {
+        if persist { Self::with_persistence(persist::state_path()) } else { Self::build(None, PoolState::default()) }
     }
     /// Pool that loads `path` at start and rewrites it on every change.
     pub fn with_persistence(path: PathBuf) -> Arc<Self> {
         let mut st = persist::load_state(&path).unwrap_or_default();
         st.expire(Utc::now());
         Self::build(Some(path), st)
-    }
-    /// Pool persisted at `~/.tandem/quota/state.json`.
-    pub fn with_default_persistence() -> Arc<Self> {
-        Self::with_persistence(persist::state_path())
     }
     fn build(persist_path: Option<PathBuf>, state: PoolState) -> Arc<Self> {
         Arc::new(Self {
@@ -75,7 +71,7 @@ impl QuotaPool {
         self.providers.lock().insert(provider.agent(), provider.clone());
         let weak = Arc::downgrade(self);
         let h = tokio::spawn(async move {
-            let first = provider.snapshot().await;
+            let first = provider.snapshot();
             match weak.upgrade() {
                 Some(pool) => pool.update(first),
                 None => return,

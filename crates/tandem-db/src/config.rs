@@ -448,10 +448,9 @@ impl fmt::Debug for ConnectionStore {
 }
 
 impl ConnectionStore {
-    /// `~/.tandem/db/connections.json`.
+    /// `$TANDEM_HOME/db/connections.json` (default `~/.tandem/db/connections.json`).
     pub fn default_path() -> Result<PathBuf, DbError> {
-        let home = dirs::home_dir().ok_or_else(|| DbError::Config("cannot determine home directory".into()))?;
-        Ok(home.join(".tandem").join("db").join("connections.json"))
+        Ok(tandem_core::fs::tandem_home().join("db").join("connections.json"))
     }
 
     /// Default location (overridable with `TANDEM_DB_STORE`) backed by the Keychain.
@@ -481,18 +480,8 @@ impl ConnectionStore {
     }
 
     fn save(&self, file: &StoreFile) -> Result<(), DbError> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| DbError::Io(e.to_string()))?;
-        }
         let json = serde_json::to_string_pretty(file).map_err(|e| DbError::Config(e.to_string()))?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).map_err(|e| DbError::Io(e.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp, &self.path).map_err(|e| DbError::Io(e.to_string()))
+        tandem_core::fs::atomic_write_mode(&self.path, json.as_bytes(), 0o600).map_err(|e| DbError::Io(e.to_string()))
     }
 
     pub fn list(&self) -> Result<Vec<ConnectionConfig>, DbError> {

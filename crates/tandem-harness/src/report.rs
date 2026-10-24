@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::path::Path;
+use tandem_core::fs::atomic_write;
 use tandem_core::{AgentId, StopReason, Usage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,16 @@ pub enum Status {
 }
 
 impl Status {
+    /// Short text label: `PASS`, `FAIL`, `skip`, `blocked`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Pass => "PASS",
+            Status::Fail => "FAIL",
+            Status::Skip => "skip",
+            Status::Blocked => "blocked",
+        }
+    }
+
     pub fn icon(self) -> &'static str {
         match self {
             Status::Pass => "✅",
@@ -92,19 +103,7 @@ fn esc_md(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
-fn short(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n).collect::<String>()) }
-}
-
-fn fmt_tokens(t: u64) -> String {
-    if t >= 1_000_000 {
-        format!("{:.1}M", t as f64 / 1e6)
-    } else if t >= 1_000 {
-        format!("{:.1}k", t as f64 / 1e3)
-    } else {
-        t.to_string()
-    }
-}
+pub use tandem_core::fmt::{ellipsize as short, fmt_tokens};
 
 impl RunResult {
     /// Counted in pass rates (not skipped or blocked).
@@ -131,14 +130,6 @@ fn read_report(p: &Path) -> Option<Report> {
             None
         }
     }
-}
-
-/// Write via a temp file + rename so a killed run never leaves a truncated JSON.
-fn write_atomic(p: &Path, content: &str) -> Result<()> {
-    let tmp = p.with_extension("tmp");
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, p)?;
-    Ok(())
 }
 
 impl Report {
@@ -175,7 +166,8 @@ impl Report {
         Some(first)
     }
 
-    fn agents(&self) -> Vec<AgentId> {
+    /// Agents with at least one result, in first-seen order.
+    pub fn agents(&self) -> Vec<AgentId> {
         let mut v: Vec<AgentId> = Vec::new();
         for r in &self.results {
             if !v.contains(&r.agent) {
@@ -185,7 +177,8 @@ impl Report {
         v
     }
 
-    fn ids(&self, kind: RunKind) -> Vec<(String, String, Option<String>)> {
+    /// (id, title, category) of every run of `kind`, in first-seen order.
+    pub fn ids(&self, kind: RunKind) -> Vec<(String, String, Option<String>)> {
         let mut v: Vec<(String, String, Option<String>)> = Vec::new();
         for r in self.results.iter().filter(|r| r.kind == kind) {
             if !v.iter().any(|x| x.0 == r.id) {
@@ -220,7 +213,7 @@ impl Report {
                     pass_rate: passed as f64 * 100.0 / runs.len() as f64,
                     median_time_s: median(&mut times),
                     // Real agents put most of the prompt in cache reads/writes; count them too.
-                    tokens: usage.input_tokens + usage.output_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
+                    tokens: usage.total(),
                     cost_usd: usage.cost_usd,
                     score: 0.0,
                 })
@@ -378,7 +371,7 @@ impl Report {
             }
             None => self.clone(),
         };
-        write_atomic(&path, &serde_json::to_string_pretty(&combined)?)?;
+        atomic_write(&path, serde_json::to_string_pretty(&combined)?.as_bytes())?;
         render_dir(dir)
     }
 }
@@ -398,9 +391,9 @@ pub fn render_dir(dir: &Path) -> Result<Report> {
         parts.push(serde_json::from_str::<Report>(&text)?);
     }
     let merged = Report::merge(parts).context("no reports")?;
-    write_atomic(&dir.join("report.json"), &serde_json::to_string_pretty(&merged)?)?;
-    write_atomic(&dir.join("report.md"), &merged.to_markdown())?;
-    write_atomic(&dir.join("leaderboard.svg"), &leaderboard_svg(&merged.date, &merged.leaderboard()))?;
+    atomic_write(&dir.join("report.json"), serde_json::to_string_pretty(&merged)?.as_bytes())?;
+    atomic_write(&dir.join("report.md"), merged.to_markdown().as_bytes())?;
+    atomic_write(&dir.join("leaderboard.svg"), leaderboard_svg(&merged.date, &merged.leaderboard()).as_bytes())?;
     Ok(merged)
 }
 

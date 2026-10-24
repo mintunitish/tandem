@@ -165,20 +165,9 @@ impl PinStore {
         self.save()
     }
 
-    pub fn unpin(&mut self, server: &str) -> Result<()> {
-        self.pins.remove(server);
-        self.save()
-    }
-
     fn save(&self) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
         let body = serde_json::to_vec_pretty(&PinFile { version: 1, servers: self.pins.clone() })?;
-        let tmp = self.path.with_extension(format!("json.tmp.{}", std::process::id()));
-        std::fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path).with_context(|| format!("renaming to {}", self.path.display()))?;
-        Ok(())
+        tandem_core::fs::atomic_write(&self.path, &body).with_context(|| format!("writing {}", self.path.display()))
     }
 }
 

@@ -1,8 +1,7 @@
 //! Lazily loaded project tree, WebStorm ordering (directories first, case-insensitive).
 
 use crate::watcher::{FsEvent, FsEventKind};
-use crate::{COLLAPSED_DIRS, is_always_hidden_name};
-use ignore::WalkBuilder;
+use crate::COLLAPSED_DIRS;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -158,21 +157,12 @@ fn sort_key(name: &str) -> String {
 fn list_dir(dir: &Path) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let walker = WalkBuilder::new(dir)
-        .max_depth(Some(1))
-        .hidden(false)
-        .require_git(false)
-        .git_global(false)
-        .follow_links(false)
-        .build();
-    for dent in walker.flatten() {
+    // The walker drops excluded names; collapsed dirs are re-added below.
+    for dent in crate::walker(dir).max_depth(Some(1)).build().flatten() {
         if dent.depth() == 0 {
             continue;
         }
         let Some(name) = dent.file_name().to_str() else { continue };
-        if is_always_hidden_name(name) {
-            continue;
-        }
         let path = dent.path().to_path_buf();
         let is_dir = is_dir_following(&path, dent.file_type().is_some_and(|t| t.is_dir()));
         seen.insert(name.to_string());

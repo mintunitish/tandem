@@ -6,14 +6,22 @@ use futures::future::BoxFuture;
 use parking_lot::Mutex;
 use tandem_core::{bounded, AgentEvent, AgentId, Receiver, Sender};
 
-/// One agent's quota source. Object-safe: `snapshot`/`reconcile` return boxed futures
+/// One agent's quota source. Object-safe: `reconcile` returns a boxed future
 /// (an `async fn` in the trait would not be usable as `Arc<dyn QuotaProvider>`).
 pub trait QuotaProvider: Send + Sync {
-    fn agent(&self) -> AgentId;
+    /// The shared snapshot state + broadcast every provider embeds.
+    fn core(&self) -> &ProviderCore;
+    fn agent(&self) -> AgentId {
+        self.core().agent()
+    }
     /// Current merged snapshot, with expired windows dropped.
-    fn snapshot(&self) -> BoxFuture<'_, QuotaSnapshot>;
+    fn snapshot(&self) -> QuotaSnapshot {
+        self.core().current()
+    }
     /// Every change as a full snapshot. Each call returns an independent receiver.
-    fn subscribe(&self) -> Receiver<QuotaSnapshot>;
+    fn subscribe(&self) -> Receiver<QuotaSnapshot> {
+        self.core().subscribe()
+    }
     /// Feed one event of this agent's task stream (stream-json taps, ACP usage, ...).
     fn ingest_event(&self, ev: &AgentEvent);
     /// Re-read the authoritative source (e.g. after a turn ends). Default: nothing.

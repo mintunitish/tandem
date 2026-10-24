@@ -114,9 +114,6 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
-    pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
-    }
 
     /// Rows as plain JSON objects (`[{col: value}]`).
     pub fn rows_json(&self) -> serde_json::Value {

@@ -145,7 +145,7 @@ pub struct Estimate {
 pub const ESTIMATE_WINDOW: usize = 10;
 
 fn total_tokens(u: &Usage) -> u64 {
-    u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_write_tokens
+    u.total()
 }
 
 fn median_u64(sorted: &[u64]) -> u64 {

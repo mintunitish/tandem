@@ -44,6 +44,10 @@ struct Common {
     /// Do not run anything: record every selected run as `blocked` with this reason.
     #[arg(long)]
     blocked: Option<String>,
+    /// `--runner acp`: launch agents in their default (auto-approving) mode instead of the
+    /// strict "ask before acting" launch.
+    #[arg(long)]
+    no_strict: bool,
 }
 
 #[derive(Subcommand)]
@@ -72,7 +76,11 @@ enum Cmd {
 
 fn make_runner(c: &Common) -> Result<Arc<dyn AgentRunner>> {
     match c.runner {
-        RunnerKind::Acp => Ok(Arc::new(AcpRunner::detect())),
+        RunnerKind::Acp => {
+            let mut r = AcpRunner::detect();
+            r.strict_permissions = !c.no_strict;
+            Ok(Arc::new(r))
+        }
         RunnerKind::Mock => Ok(Arc::new(match &c.mock_script {
             Some(p) => MockRunner::from_yaml(&std::fs::read_to_string(p)?)?,
             None => MockRunner::new(),

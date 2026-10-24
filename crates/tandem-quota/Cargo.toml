@@ -14,7 +14,6 @@ tracing.workspace = true
 tokio.workspace = true
 futures.workspace = true
 chrono.workspace = true
-notify.workspace = true
 dirs.workspace = true
 parking_lot.workspace = true
 # Same libsqlite3-sys (0.30) as sqlx-sqlite, so the `links = "sqlite3"` check passes.
@@ -22,7 +21,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-
-[[bin]]
-name = "tandem-quota-sink"
-path = "src/bin/tandem-quota-sink.rs"
+# Built-in agent descriptors (quota_kind) for the demo.
+tandem-acp.workspace = true

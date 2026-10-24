@@ -11,36 +11,21 @@ use anyhow::{Context as _, Result, anyhow};
 use futures::channel::oneshot;
 use futures::{FutureExt as _, StreamExt as _};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
 use crate::launch::{self, SpawnOptions};
 use tandem_core::{
-    AgentDescriptor, AgentEvent, Decider, Direction, EventTx, PermissionDecision, PermissionOption,
-    PermissionOptionKind, PermissionRequest, Policy, RequestId, RiskClass, SessionId, StopReason,
-    TaskEvent, TaskId, ToolCall,
+    AgentDescriptor, AgentEvent, Decider, Direction, EventTx, McpServerSpec, PermissionClassifier,
+    PermissionDecision, PermissionOption, PermissionOptionKind, PermissionRequest, RequestId,
+    RiskClass, Role, SessionId, StopReason, TaskEvent, TaskId,
 };
 use tandem_sandbox::kill::{self, KillSwitch};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-/// Stdio MCP server handed to the agent at `session/new`.
-#[derive(Clone, Debug, Default)]
-pub struct McpServerSpec {
-    pub name: String,
-    pub command: PathBuf,
-    pub args: Vec<String>,
-    pub env: BTreeMap<String, String>,
-}
-
-/// Assigns a risk class to a permission request before the UI sees it.
-/// Implemented by tandem-sandbox; the default returns `Review` with no reason.
-pub trait PermissionClassifier: Send + Sync {
-    fn classify(&self, _call: &ToolCall) -> (RiskClass, String) {
-        (RiskClass::Review, String::new())
-    }
-}
-
-/// Classifier that marks everything `Review`.
+/// Classifier that marks everything `Review` (tests, demos).
 pub struct DefaultClassifier;
 impl PermissionClassifier for DefaultClassifier {}
 
@@ -75,55 +60,15 @@ impl Emit {
 pub struct AcpAgent;
 
 impl AcpAgent {
-    /// Spawn `desc` in `cwd`, run `initialize` + `session/new`, return a live handle.
-    /// Thin wrapper over [`AcpAgent::spawn_opts`]: scrubbed env, no sandbox, every
-    /// permission request classified `Review`.
-    pub async fn spawn(
-        desc: &AgentDescriptor,
-        cwd: PathBuf,
-        env: BTreeMap<String, String>,
-        mcp_servers: Vec<McpServerSpec>,
-        tx: EventTx,
-        task: TaskId,
-    ) -> Result<AgentHandle> {
-        Self::spawn_classified(
-            desc,
-            cwd,
-            env,
-            mcp_servers,
-            (tx, task),
-            Arc::new(DefaultClassifier),
-        )
-        .await
-    }
-
-    /// Like [`AcpAgent::spawn`] with a custom permission classifier.
-    pub async fn spawn_classified(
-        desc: &AgentDescriptor,
-        cwd: PathBuf,
-        env: BTreeMap<String, String>,
-        mcp_servers: Vec<McpServerSpec>,
-        (tx, task): (EventTx, TaskId),
-        classifier: Arc<dyn PermissionClassifier>,
-    ) -> Result<AgentHandle> {
-        let opts = SpawnOptions {
-            project_root: cwd.clone(),
-            cwd,
-            policy: Policy::default(),
-            sandbox: false,
-            env_overrides: env,
-            mcp_servers,
-            classifier,
-        };
-        Self::spawn_opts(desc, opts, tx, task).await
-    }
-
+    /// Spawn `desc` per `opts`, run `initialize` + `session/new`, return a live handle.
+    ///
     /// Enforced launch: env scrubbed ([`crate::launch::child_env`]), optionally inside
     /// Seatbelt, own process group registered with the global Kill Switch, and
     /// permission requests classified by `opts.classifier`. With
     /// `policy.auto_allow_safe`, `Safe` requests are answered by policy; `Review` and
-    /// `Destructive` always go to the UI / decider.
-    pub async fn spawn_opts(
+    /// `Destructive` always go to the UI / decider. Dropping the returned future before it
+    /// resolves (timeout) kills the agent's process group.
+    pub async fn spawn(
         desc: &AgentDescriptor,
         opts: SpawnOptions,
         tx: EventTx,
@@ -143,7 +88,7 @@ impl AcpAgent {
         let parent: HashMap<String, String> = std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
             .collect();
-        let env = launch::child_env(&parent, &opts.policy, desc, &opts.env_overrides);
+        let env = launch::child_env(&parent, &opts.policy, desc, opts.strict_permissions, &opts.env_overrides);
         let (program, args) = launch::launch_command(desc, &opts, &env);
         let mut command = tokio::process::Command::new(&program);
         command
@@ -161,7 +106,10 @@ impl AcpAgent {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
         let pending: Pending = Arc::default();
+        // Exists before the handshake so a dropped spawn future still kills the group.
+        let group = GroupGuard::default();
         let ctx = Session {
+            pgid: group.0.clone(),
             agent: desc.id.clone(),
             cwd: opts.cwd,
             mcp_servers: opts.mcp_servers,
@@ -195,22 +143,57 @@ impl AcpAgent {
             pending,
             emit,
             done: done_rx,
+            group,
         })
     }
 }
 
-/// Live agent session. Dropping it kills the agent process.
+/// SIGTERMs (then SIGKILLs) the agent's process group on drop, off-thread.
+#[derive(Default)]
+struct GroupGuard(Arc<AtomicI32>);
+
+impl GroupGuard {
+    fn pgid(&self) -> Option<i32> {
+        Some(self.0.load(Ordering::SeqCst)).filter(|p| *p > 1)
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid() {
+            std::thread::spawn(move || kill::stop_group(pgid, Duration::from_millis(1500)));
+        }
+    }
+}
+
+/// Live agent session. Dropping it kills the agent's whole process group.
 pub struct AgentHandle {
     cmd_tx: async_channel::Sender<Cmd>,
     session: SessionId,
     pending: Pending,
     emit: Emit,
     done: oneshot::Receiver<()>,
+    group: GroupGuard,
 }
 
 impl AgentHandle {
-    /// Send a prompt; resolves when the turn ends. Events stream on the task channel meanwhile.
+    /// Process group of the agent (== its pid), once started.
+    pub fn pgid(&self) -> Option<i32> {
+        self.group.pgid()
+    }
+
+    /// Stop the agent's process group and the groups its tools moved into: SIGTERM now,
+    /// SIGKILL survivors after `grace`. Blocks for at most `grace`.
+    pub fn kill_group(&self, grace: Duration) {
+        if let Some(pgid) = self.pgid() {
+            kill::stop_group(pgid, grace);
+        }
+    }
+
+    /// Send a prompt; resolves when the turn ends. The prompt itself is emitted first as
+    /// `TextDelta { role: User }`; the turn's events stream on the task channel meanwhile.
     pub async fn prompt(&self, text: String) -> Result<StopReason> {
+        self.emit.send(AgentEvent::TextDelta { role: Role::User, text: text.clone() }).await;
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Cmd::Prompt(text, tx))
@@ -258,6 +241,19 @@ impl AgentHandle {
             .map_err(|_| anyhow!("permission request no longer pending"))
     }
 
+    /// Answer `req` with its option of `kind` (falling back to the same-polarity sibling,
+    /// see [`PermissionRequest::option_for`]); with no such option the request is cancelled.
+    pub async fn respond_choice(&self, req: &PermissionRequest, kind: PermissionOptionKind, by: Decider) -> Result<()> {
+        match req.option_for(kind) {
+            Some(o) => self.respond_permission(PermissionDecision { request: req.id.clone(), option_id: o.id.clone() }, by).await,
+            None => {
+                // Dropping the sender answers the agent with `cancelled`.
+                self.pending.lock().remove(&req.id);
+                Err(anyhow!("request {} has no {kind:?} option; cancelled", req.id))
+            }
+        }
+    }
+
     /// Close the connection and wait for the agent process to be gone.
     pub async fn shutdown(self) {
         let _ = self.cmd_tx.send(Cmd::Shutdown).await;
@@ -266,6 +262,7 @@ impl AgentHandle {
 }
 
 struct Session {
+    pgid: Arc<AtomicI32>,
     agent: tandem_core::AgentId,
     cwd: PathBuf,
     mcp_servers: Vec<McpServerSpec>,
@@ -300,6 +297,7 @@ impl Session {
         };
         let pid = child.id();
         if let Some(pid) = pid {
+            self.pgid.store(pid as i32, Ordering::SeqCst);
             KillSwitch::global().register(pid, format!("acp:{}", self.agent));
         }
         let agent = self.agent.clone();

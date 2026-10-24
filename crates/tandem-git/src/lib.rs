@@ -16,7 +16,7 @@ pub mod worktree;
 
 pub use apply::{apply_file, apply_hunk_to_file, apply_hunks, copy_file_from_worktree};
 pub use blame::BlameHunk;
-pub use diff::{GutterMark, MAX_TEXT_BYTES, compute_hunks};
+pub use diff::{GutterKind, GutterMark, MAX_TEXT_BYTES, compute_hunks};
 pub use error::{GitError, Result};
 pub use worktree::TaskWorktree;
 

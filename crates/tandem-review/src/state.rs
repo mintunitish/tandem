@@ -91,11 +91,6 @@ impl ReviewState {
 
     pub fn is_complete(&self) -> bool { self.counts().pending == 0 }
 
-    /// Move the cursor to an explicit change.
-    pub fn goto(&mut self, at: HunkRef) -> bool {
-        if self.decision(at).is_some() { self.cursor = Some(at); true } else { false }
-    }
-
     fn step(&mut self, forward: bool, only_pending: bool) -> Option<HunkRef> {
         let all = self.changes();
         if all.is_empty() { return None }

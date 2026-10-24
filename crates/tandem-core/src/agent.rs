@@ -4,8 +4,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// Which quota provider tracks an agent's plan usage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaKind {
+    Codex,
+    Claude,
+    /// Generic ACP usage updates (the default for unknown agents).
+    #[default]
+    AcpGeneric,
+    Gemini,
+    Goose,
+    /// No quota tracking.
+    None,
+}
+
 /// How an agent is launched. Always the vendor's unmodified binary.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// The capability fields below (env allow-list, config dirs, strict-permission launch,
+/// login command, badge, quota provider) are filled for built-ins by
+/// `tandem_acp::registry`; custom agents may set them in `.tandem/agents.json`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AgentDescriptor {
     pub id: AgentId,
     pub display_name: String,
@@ -20,6 +39,39 @@ pub struct AgentDescriptor {
     pub acp: bool,
     /// Where the user's subscription login lives, informational only. Never read.
     pub auth_note: String,
+    /// Vendor env var prefixes the agent inherits (e.g. `ANTHROPIC_`).
+    #[serde(default)]
+    pub env_prefixes: Vec<String>,
+    /// Vendor env var names the agent inherits (e.g. `GITHUB_TOKEN`).
+    #[serde(default)]
+    pub env_exact: Vec<String>,
+    /// The agent's own config/state dirs, relative to `$HOME` (writable in the sandbox).
+    #[serde(default)]
+    pub home_dirs: Vec<String>,
+    /// Extra args that make the agent ask (ACP `session/request_permission`) instead of
+    /// auto-approving shell commands and out-of-worktree writes.
+    #[serde(default)]
+    pub strict_args: Vec<String>,
+    /// Extra env for the same purpose, set after scrubbing.
+    #[serde(default)]
+    pub strict_env: BTreeMap<String, String>,
+    /// Vendor login command (program + args) for "Sign in".
+    #[serde(default)]
+    pub login_command: Option<Vec<String>>,
+    /// Avatar letters and color as hex `RRGGBB`.
+    #[serde(default)]
+    pub badge: (String, String),
+    #[serde(default)]
+    pub quota_kind: QuotaKind,
+}
+
+/// Stdio MCP server handed to the agent at `session/new`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerSpec {
+    pub name: String,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

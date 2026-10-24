@@ -54,13 +54,8 @@ impl TaskRecord {
 }
 
 pub fn save(root: &Path, t: &AgentTask) {
-    let dir = task_dir(root, &t.id);
-    let _ = std::fs::create_dir_all(&dir);
     if let Ok(json) = serde_json::to_string_pretty(&TaskRecord::of(t)) {
-        let tmp = dir.join("task.json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(tmp, dir.join("task.json"));
-        }
+        let _ = tandem_core::fs::atomic_write(&task_dir(root, &t.id).join("task.json"), json.as_bytes());
     }
 }
 
@@ -117,6 +112,7 @@ mod tests {
         let mut log = ReplayLog::open(task_dir(&root, &t.id)).unwrap();
         log.record(&t.id, &AgentEvent::TextDelta { role: Role::User, text: "Fix it".into() }).unwrap();
         log.record(&t.id, &AgentEvent::TextDelta { role: Role::Assistant, text: "Done".into() }).unwrap();
+        drop(log); // flushes the buffered records
         let back = restore(&root);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].title, "Fix it");

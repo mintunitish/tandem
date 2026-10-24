@@ -136,28 +136,8 @@ pub fn walk_files(root: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 
 /// Atomically writes `bytes` to `path` (temp file in the same dir + rename), mode 0600.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write;
     check(path)?;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(
-        ".{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("out"),
-        std::process::id()
-    ));
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
+    tandem_core::fs::atomic_write_mode(path, bytes, 0o600)
 }
 
 #[cfg(test)]

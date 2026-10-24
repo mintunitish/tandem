@@ -7,7 +7,7 @@
 //! `account/rateLimits/updated` (sparse) and `thread/tokenUsage/updated`.
 //! The app-server uses its own login; Tandem never touches `~/.codex/auth.json`.
 
-use super::{codex_logs, get, get_f64, raw_json, session_windows, usage_from_json};
+use super::{codex_logs, get, get_f64, session_windows};
 use crate::model::{duration_label, parse_ts, QuotaSnapshot, Source, Status, Unit, Window, WindowKind};
 use crate::provider::{ProviderCore, QuotaProvider};
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,7 +21,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tandem_core::{AgentEvent, AgentId, Receiver, Usage};
+use tandem_core::{AgentEvent, Usage};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::oneshot;
@@ -35,14 +35,17 @@ pub struct CodexOptions {
     /// `~/.codex/sessions` (fallback logs). `None` disables the fallback.
     pub sessions_dir: Option<PathBuf>,
     pub request_timeout: Duration,
+    /// In-memory only: never reads session logs or spawns the app-server.
+    pub offline: bool,
 }
 impl Default for CodexOptions {
     fn default() -> Self {
         Self {
             program: "codex".into(),
             args: vec!["app-server".into()],
-            sessions_dir: dirs::home_dir().map(|h| h.join(".codex").join("sessions")),
+            sessions_dir: Some(tandem_core::fs::home().join(".codex").join("sessions")),
             request_timeout: Duration::from_secs(20),
+            offline: false,
         }
     }
 }
@@ -272,6 +275,9 @@ impl CodexProvider {
     /// Loads the session-log fallback, then connects to the app-server and reads rate
     /// limits. App-server failures are recorded in the snapshot's `error`.
     pub async fn start(&self) -> Result<()> {
+        if self.opts.offline {
+            return Ok(());
+        }
         self.load_logs();
         let r = self.connect().await;
         if let Err(e) = &r {
@@ -283,7 +289,7 @@ impl CodexProvider {
 
     /// Reads the newest `~/.codex/sessions/**/*.jsonl` `token_count` row (Source::LocalLog).
     pub fn load_logs(&self) -> bool {
-        let Some(dir) = &self.opts.sessions_dir else { return false };
+        let Some(dir) = self.opts.sessions_dir.as_ref().filter(|_| !self.opts.offline) else { return false };
         match codex_logs::latest_from_dir(dir) {
             Some(d) => {
                 self.core.apply(d);
@@ -312,6 +318,9 @@ impl CodexProvider {
     }
 
     async fn reconcile_inner(&self) {
+        if self.opts.offline {
+            return;
+        }
         let client = self.client.lock().await.clone();
         let r = match client {
             Some(c) => self.read_rate_limits(&c).await,
@@ -326,20 +335,13 @@ impl CodexProvider {
 }
 
 impl QuotaProvider for CodexProvider {
-    fn agent(&self) -> AgentId {
-        self.core.agent()
-    }
-    fn snapshot(&self) -> BoxFuture<'_, QuotaSnapshot> {
-        Box::pin(async move { self.core.current() })
-    }
-    fn subscribe(&self) -> Receiver<QuotaSnapshot> {
-        self.core.subscribe()
+    fn core(&self) -> &ProviderCore {
+        &self.core
     }
     fn reconcile(&self) -> BoxFuture<'_, ()> {
         Box::pin(self.reconcile_inner())
     }
     fn ingest_event(&self, ev: &AgentEvent) {
-        let now = Utc::now();
         match ev {
             AgentEvent::Usage(u) => {
                 let total = {
@@ -348,23 +350,8 @@ impl QuotaProvider for CodexProvider {
                     s.clone()
                 };
                 let mut d = self.core.delta();
-                d.windows = session_windows(&total, Source::AgentEvent, now);
+                d.windows = session_windows(&total, Source::AgentEvent, Utc::now());
                 self.core.apply(d);
-            }
-            AgentEvent::Raw { json, .. } => {
-                let Some(v) = raw_json(json) else { return };
-                if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
-                    // App-server traffic captured by another client (e.g. tandem-acp).
-                    handle_notification(&self.core, m, v.get("params").unwrap_or(&Value::Null));
-                } else if v.get("type").and_then(|t| t.as_str()) == Some("turn.completed") {
-                    // `codex exec --json`.
-                    if let Some(mut u) = v.get("usage").and_then(usage_from_json) {
-                        u.input_tokens = u.input_tokens.saturating_sub(u.cache_read_tokens); // cached ⊂ input
-                        self.ingest_event(&AgentEvent::Usage(u));
-                    }
-                } else if let Some(d) = codex_logs::parse_row(&v) {
-                    self.core.apply(d);
-                }
             }
             AgentEvent::Done { .. } => {
                 // Turn ended: re-read the authoritative numbers in the background.

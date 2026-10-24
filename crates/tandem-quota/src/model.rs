@@ -1,9 +1,8 @@
-//! Quota data model. Extends `tandem_core::QuotaWindow` locally with units, a finer
-//! source ladder and a window kind; converts back with [`Window::to_core`].
+//! Quota data model: windows with units, a source confidence ladder and a window kind.
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use tandem_core::{AgentId, QuotaSource, QuotaWindow};
+use tandem_core::AgentId;
 
 /// What a window's `used` / `limit` count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,13 +29,6 @@ pub enum Source {
     AgentRpc,
 }
 impl Source {
-    pub fn to_core(self) -> QuotaSource {
-        match self {
-            Source::AgentRpc => QuotaSource::Official,
-            Source::AgentEvent | Source::LocalLog => QuotaSource::Derived,
-            Source::Heuristic => QuotaSource::Estimated,
-        }
-    }
     /// Router confidence multiplier.
     pub fn weight(self) -> f64 {
         match self {
@@ -136,19 +128,6 @@ impl Window {
     }
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
         self.reset_at.is_some_and(|r| r <= now)
-    }
-    pub fn to_core(&self, agent: &AgentId) -> QuotaWindow {
-        let tokens = matches!(self.unit, Unit::Tokens);
-        QuotaWindow {
-            agent: agent.clone(),
-            label: self.label.clone(),
-            used_fraction: self.used_fraction,
-            used_tokens: self.used.filter(|_| tokens).map(|v| v as u64),
-            limit_tokens: self.limit.filter(|_| tokens).map(|v| v as u64),
-            reset_at: self.reset_at,
-            source: self.source.to_core(),
-            observed_at: self.observed_at,
-        }
     }
 }
 
@@ -373,14 +352,5 @@ mod tests {
         let a = parse_ts(&serde_json::json!(1792801200)).unwrap();
         assert_eq!(parse_ts(&serde_json::json!(1792801200000_i64)), Some(a));
         assert_eq!(parse_ts(&serde_json::json!(a.to_rfc3339())), Some(a));
-    }
-
-    #[test]
-    fn to_core_maps_tokens() {
-        let w = Window::new("context", Unit::Tokens, Source::LocalLog, t(0)).with_amounts(Some(50.0), Some(200.0));
-        let c = w.to_core(&"codex".into());
-        assert_eq!(c.used_tokens, Some(50));
-        assert_eq!(c.used_fraction, Some(0.25));
-        assert_eq!(c.source, QuotaSource::Derived);
     }
 }

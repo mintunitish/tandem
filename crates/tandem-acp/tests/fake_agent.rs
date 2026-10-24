@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
-use tandem_acp::{AcpAgent, AgentHandle, ReplayLog};
+use tandem_acp::{AcpAgent, AgentHandle, ReplayLog, SpawnOptions};
 use tandem_core::{
     AgentDescriptor, AgentEvent, Decider, EventRx, PermissionDecision, Role, StopReason, TaskId,
     ToolKind, ToolStatus,
@@ -17,20 +17,14 @@ fn fake() -> AgentDescriptor {
         install_hint: String::new(),
         acp: true,
         auth_note: String::new(),
+        ..Default::default()
     }
 }
 
 async fn start(dir: &std::path::Path) -> (AgentHandle, EventRx, TaskId) {
     let (tx, rx) = tandem_core::unbounded();
     let task = TaskId::from("task-1");
-    let h = AcpAgent::spawn(
-        &fake(),
-        dir.to_path_buf(),
-        BTreeMap::new(),
-        vec![],
-        tx,
-        task.clone(),
-    )
+    let h = AcpAgent::spawn(&fake(), SpawnOptions::unsandboxed(dir), tx, task.clone())
     .await
     .expect("spawn");
     (h, rx, task)
@@ -66,6 +60,10 @@ async fn run_turn(allow: bool) -> (Vec<AgentEvent>, tempfile::TempDir) {
         async move { h.prompt("do it".into()).await }
     };
     let drive = async {
+        // The prompt itself comes first, so the replay log and UI see it.
+        assert!(
+            matches!(next(&rx, &mut all).await, AgentEvent::TextDelta { role: Role::User, ref text } if text == "do it")
+        );
         assert!(
             matches!(next(&rx, &mut all).await, AgentEvent::TextDelta { role: Role::Assistant, ref text } if text == "Hello")
         );
@@ -192,7 +190,7 @@ async fn cancel_mid_turn() {
     };
     let drive = async {
         loop {
-            if let AgentEvent::TextDelta { text, .. } = next(&rx, &mut all).await {
+            if let AgentEvent::TextDelta { role: Role::Assistant, text } = next(&rx, &mut all).await {
                 assert_eq!(text, "working");
                 break;
             }
@@ -215,14 +213,7 @@ async fn missing_binary_is_an_error() {
     let mut d = fake();
     d.command = "/nonexistent/agent-binary".into();
     let (tx, _rx) = tandem_core::unbounded();
-    let err = AcpAgent::spawn(
-        &d,
-        std::env::temp_dir(),
-        BTreeMap::new(),
-        vec![],
-        tx,
-        TaskId::new(),
-    )
+    let err = AcpAgent::spawn(&d, SpawnOptions::unsandboxed(std::env::temp_dir()), tx, TaskId::new())
     .await
     .err()
     .expect("error");

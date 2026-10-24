@@ -16,6 +16,7 @@ fn fake() -> AgentDescriptor {
         install_hint: String::new(),
         acp: true,
         auth_note: String::new(),
+        ..Default::default()
     }
 }
 
@@ -25,7 +26,7 @@ async fn stop_all_kills_agents_and_refuses_spawns() {
     let mut opts = SpawnOptions::new(dir.path(), dir.path(), Policy::default());
     opts.sandbox = false;
     let (tx, _rx) = tandem_core::unbounded();
-    let h = AcpAgent::spawn_opts(&fake(), opts.clone(), tx.clone(), TaskId::new())
+    let h = AcpAgent::spawn(&fake(), opts.clone(), tx.clone(), TaskId::new())
         .await
         .expect("spawn");
     assert_eq!(tandem_sandbox::KillSwitch::global().entries().len(), 1);
@@ -43,13 +44,13 @@ async fn stop_all_kills_agents_and_refuses_spawns() {
     assert!(res.is_err() || res.unwrap() != tandem_core::StopReason::EndTurn);
     h.shutdown().await;
 
-    let err = AcpAgent::spawn_opts(&fake(), opts.clone(), tx.clone(), TaskId::new())
+    let err = AcpAgent::spawn(&fake(), opts.clone(), tx.clone(), TaskId::new())
         .await
         .err()
         .expect("refused while tripped");
     assert!(err.to_string().contains("STOP"), "{err}");
     tandem_acp::reset_stop();
-    let h = AcpAgent::spawn_opts(&fake(), opts, tx, TaskId::new())
+    let h = AcpAgent::spawn(&fake(), opts, tx, TaskId::new())
         .await
         .expect("spawn after reset");
     h.shutdown().await;

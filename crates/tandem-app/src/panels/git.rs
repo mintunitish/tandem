@@ -17,7 +17,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use tandem_core::{FileChange, FileDiff, LineKind};
+use tandem_core::FileDiff;
 use tandem_git::{BranchInfo, Change, CommitInfo, Repo, StatusEntry};
 
 fn change_color(e: &StatusEntry, p: &Palette) -> Hsla {
@@ -276,29 +276,7 @@ impl Render for CommitPanel {
 
 /// Unified patch text for one `FileDiff`, as gpui-kit's `DiffFile::parse` expects.
 pub fn to_patch(fd: &FileDiff) -> String {
-    let p = fd.path.display().to_string();
-    let old = fd.old_path.as_ref().map(|o| o.display().to_string()).unwrap_or_else(|| p.clone());
-    let mut s = format!("diff --git a/{old} b/{p}\n");
-    match fd.change {
-        FileChange::Added => s.push_str(&format!("new file mode 100644\n--- /dev/null\n+++ b/{p}\n")),
-        FileChange::Deleted => s.push_str(&format!("deleted file mode 100644\n--- a/{old}\n+++ /dev/null\n")),
-        _ => s.push_str(&format!("--- a/{old}\n+++ b/{p}\n")),
-    }
-    for h in &fd.hunks {
-        s.push_str(&format!("@@ -{},{} +{},{} @@\n", h.old_start, h.old_lines, h.new_start, h.new_lines));
-        for l in &h.lines {
-            s.push(match l.kind {
-                LineKind::Added => '+',
-                LineKind::Removed => '-',
-                LineKind::Context => ' ',
-            });
-            s.push_str(&l.text);
-            if !l.text.ends_with('\n') {
-                s.push_str("\n\\ No newline at end of file\n");
-            }
-        }
-    }
-    s
+    fd.to_patch()
 }
 
 pub struct GitLogPanel {
@@ -532,6 +510,7 @@ pub fn branches_dialog(root: PathBuf, on_checkout: OnCheckout, window: &mut Wind
 mod tests {
     use super::*;
     use core::prelude::v1::test;
+    use tandem_core::FileChange;
 
     #[test]
     fn patch_roundtrips_through_gpui_kit_parser() {

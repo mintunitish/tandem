@@ -4,14 +4,9 @@ use crate::stripes::ToolWindowId;
 use crate::theme::ThemeKind;
 use gpui_kit::Global;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-pub fn tandem_home() -> PathBuf {
-    std::env::var_os("TANDEM_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".tandem")))
-        .unwrap_or_else(|| PathBuf::from(".tandem"))
-}
+pub use tandem_core::fs::tandem_home;
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()

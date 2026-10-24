@@ -11,3 +11,4 @@ chrono.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 async-channel.workspace = true
+similar.workspace = true

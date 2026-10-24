@@ -2,12 +2,12 @@
 //!
 //! One fresh agent process per run, cwd = the run's fixture worktree. Every
 //! event is forwarded to the harness; permission requests are answered by the
-//! scenario's [`PermissionDecider`]. The agent is started in its own process
-//! group (through a tiny `sh` wrapper that records the group id), and the whole
-//! group is killed when the run ends or its future is dropped (timeout/cancel),
-//! so `npx` → `node` → tool subprocesses do not outlive the run.
+//! scenario's [`PermissionDecider`]. The agent runs in its own process group,
+//! which [`tandem_acp::AgentHandle`] kills when the run ends or its future is
+//! dropped (timeout/cancel), so `npx` → `node` → tool subprocesses do not
+//! outlive the run.
 //!
-//! Agents are launched through [`AcpAgent::spawn_opts`]: scrubbed environment,
+//! Agents are launched through [`AcpAgent::spawn`]: scrubbed environment,
 //! Seatbelt sandbox (worktree = project = the fixture dir), Kill Switch
 //! registration, and tandem-sandbox's classifier on every permission request
 //! (`Safe` is answered by policy, everything else goes to the decider).
@@ -23,38 +23,6 @@ use std::time::{Duration, Instant};
 use tandem_acp::{AcpAgent, SpawnOptions};
 use tandem_core::{AgentDescriptor, AgentEvent, AgentId, Decider, EventTx, Policy, TaskEvent, TaskId, Usage};
 
-/// Kills a process group on drop: SIGTERM now, SIGKILL shortly after.
-struct GroupKill(Option<i32>);
-
-impl GroupKill {
-    fn signal(pgid: i32, sig: &str) {
-        let _ = std::process::Command::new("kill")
-            .args([sig, "--", &format!("-{pgid}")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-}
-
-impl Drop for GroupKill {
-    fn drop(&mut self) {
-        let Some(pgid) = self.0.take() else { return };
-        // Tool shells the agent started in their own groups (opencode does) would
-        // survive a signal to the agent's group alone; collect them first.
-        let mut groups = vec![pgid];
-        groups.extend(tandem_sandbox::kill::descendant_groups(pgid));
-        for g in &groups {
-            Self::signal(*g, "-TERM");
-        }
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(1500));
-            for g in groups {
-                Self::signal(g, "-KILL");
-            }
-        });
-    }
-}
-
 /// Runs prompts against real ACP agents.
 pub struct AcpRunner {
     descriptors: HashMap<AgentId, AgentDescriptor>,
@@ -64,6 +32,8 @@ pub struct AcpRunner {
     pub policy: Policy,
     /// Run agents under Seatbelt (default on).
     pub sandbox: bool,
+    /// Launch agents in their "ask before acting" mode (default on; `--no-strict` turns it off).
+    pub strict_permissions: bool,
 }
 
 impl AcpRunner {
@@ -78,6 +48,7 @@ impl AcpRunner {
             env: BTreeMap::new(),
             policy: Policy::default(),
             sandbox: true,
+            strict_permissions: true,
         }
     }
 
@@ -98,18 +69,6 @@ impl AcpRunner {
     }
 }
 
-/// Wraps `desc` in `sh -c 'echo $$ > pidfile; exec cmd args…'`. tandem-acp
-/// starts the child with `process_group(0)`, so `$$` is the group id.
-fn wrap_with_pidfile(desc: &AgentDescriptor, pidfile: &Path) -> AgentDescriptor {
-    let mut d = desc.clone();
-    d.command = "/bin/sh".into();
-    d.args = ["-c".to_string(), r#"echo $$ > "$0"; exec "$@""#.to_string(), pidfile.to_string_lossy().into_owned(), desc.command.clone()]
-        .into_iter()
-        .chain(desc.args.iter().cloned())
-        .collect();
-    d
-}
-
 #[async_trait]
 impl AgentRunner for AcpRunner {
     async fn run(
@@ -122,9 +81,6 @@ impl AgentRunner for AcpRunner {
     ) -> Result<RunOutcome> {
         let start = Instant::now();
         let desc = self.descriptor(agent)?;
-        let pid_dir = tempfile::Builder::new().prefix("tandem-harness-pid-").tempdir()?;
-        let pidfile = pid_dir.path().join("pgid");
-        let wrapped = wrap_with_pidfile(&desc, &pidfile);
 
         let task = TaskId::new();
         let (itx, irx) = async_channel::unbounded::<TaskEvent>();
@@ -133,24 +89,12 @@ impl AgentRunner for AcpRunner {
             async move { tx.send(TaskEvent { task, event }).await.map_err(|e| anyhow!("event channel closed: {e}")) }
         };
 
-        // The guard must exist before the (possibly long) handshake so a
-        // timeout during startup still kills the process group.
-        let mut guard = GroupKill(None);
-        let read_pgid = || std::fs::read_to_string(&pidfile).ok().and_then(|s| s.trim().parse::<i32>().ok());
         let mut opts = SpawnOptions::new(cwd, cwd, self.policy.clone());
         opts.sandbox = self.sandbox;
+        opts.strict_permissions = self.strict_permissions;
         opts.env_overrides = self.env.clone();
-        let mut spawn = pin!(AcpAgent::spawn_opts(&wrapped, opts, itx, task.clone()));
-        let spawned = loop {
-            tokio::select! {
-                biased;
-                r = &mut spawn => break r,
-                _ = tokio::time::sleep(Duration::from_millis(50)), if guard.0.is_none() => guard.0 = read_pgid(),
-            }
-        };
-        if guard.0.is_none() {
-            guard.0 = read_pgid();
-        }
+        // Dropping this future (timeout) kills the agent's process group.
+        let spawned = AcpAgent::spawn(&desc, opts, itx, task.clone()).await;
         // Forward startup events (raw handshake, errors) even when spawning failed.
         while let Ok(te) = irx.try_recv() {
             forward(te.event).await?;
@@ -202,8 +146,8 @@ impl AgentRunner for AcpRunner {
             on_event(te.event, &handle).await?;
         }
         let stop = stop?;
+        // Shutdown (or dropping the handle on timeout) kills the whole process group.
         let _ = tokio::time::timeout(Duration::from_secs(5), handle.shutdown()).await;
-        drop(guard);
         Ok(RunOutcome { stop, usage, elapsed: start.elapsed() })
     }
 }
@@ -241,23 +185,5 @@ mod tests {
         let mut src = call(ToolKind::Read, "Read src/lib.rs");
         src.locations = vec![root.join("src/lib.rs")];
         assert_eq!(c.classify(&src).0, RiskClass::Safe);
-    }
-
-    #[test]
-    fn wrapper_keeps_args() {
-        let d = AgentDescriptor {
-            id: "x".into(),
-            display_name: "x".into(),
-            vendor: "x".into(),
-            command: "goose".into(),
-            args: vec!["acp".into()],
-            env: BTreeMap::new(),
-            install_hint: String::new(),
-            acp: true,
-            auth_note: String::new(),
-        };
-        let w = wrap_with_pidfile(&d, Path::new("/tmp/p"));
-        assert_eq!(w.command, "/bin/sh");
-        assert_eq!(&w.args[2..], ["/tmp/p", "goose", "acp"]);
     }
 }

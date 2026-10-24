@@ -6,12 +6,11 @@
 //! write is decided by the Seatbelt profile, what it inherits by [`child_env`].
 //! See docs/specs/2026-10-24-tandem-design.md, "Security model" / "Kill Switch".
 
-use crate::client::{McpServerSpec, PermissionClassifier};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tandem_core::{AgentDescriptor, Policy, RiskClass, ToolCall};
-use tandem_sandbox::env::{HARD_DENY, HARD_DENY_PREFIXES};
+use tandem_core::{AgentDescriptor, McpServerSpec, PermissionClassifier, Policy};
+use tandem_sandbox::env::hard_denied;
 use tandem_sandbox::kill::{KillSwitch, StopReport};
 use tandem_sandbox::seatbelt::{self, SandboxSpec};
 
@@ -25,6 +24,9 @@ pub struct SpawnOptions {
     pub policy: Policy,
     /// Wrap the agent in `sandbox-exec` (macOS Seatbelt).
     pub sandbox: bool,
+    /// Launch with the descriptor's `strict_args` / `strict_env` so the agent asks before
+    /// running shell commands (see [`AgentDescriptor::strict_args`]).
+    pub strict_permissions: bool,
     /// Explicit variables added after scrubbing (not filtered, except code-injection vars).
     pub env_overrides: BTreeMap<String, String>,
     pub mcp_servers: Vec<McpServerSpec>,
@@ -33,16 +35,14 @@ pub struct SpawnOptions {
 }
 
 impl SpawnOptions {
-    /// `policy.sandbox` decides `sandbox`; the classifier is [`tandem_sandbox::Classifier`].
+    /// `policy.sandbox` / `policy.strict_permissions` decide `sandbox` / `strict_permissions`;
+    /// the classifier is [`tandem_sandbox::Classifier`].
     pub fn new(cwd: impl Into<PathBuf>, project_root: impl Into<PathBuf>, policy: Policy) -> Self {
         let (cwd, project_root) = (canonical(cwd.into()), canonical(project_root.into()));
-        let classifier = Arc::new(tandem_sandbox::Classifier::new(
-            policy.clone(),
-            &project_root,
-            &cwd,
-        ));
+        let classifier = Arc::new(tandem_sandbox::Classifier::new(policy.clone(), &project_root, &cwd));
         SpawnOptions {
             sandbox: policy.sandbox,
+            strict_permissions: policy.strict_permissions,
             cwd,
             project_root,
             policy,
@@ -53,70 +53,40 @@ impl SpawnOptions {
     }
 }
 
+impl SpawnOptions {
+    /// No sandbox, default policy, project root = `cwd`, every permission request
+    /// classified `Review` (tests, demos, harness fakes).
+    pub fn unsandboxed(cwd: impl Into<PathBuf>) -> Self {
+        let cwd = canonical(cwd.into());
+        SpawnOptions {
+            project_root: cwd.clone(),
+            cwd,
+            policy: Policy::default(),
+            sandbox: false,
+            strict_permissions: true,
+            env_overrides: BTreeMap::new(),
+            mcp_servers: vec![],
+            classifier: Arc::new(crate::DefaultClassifier),
+        }
+    }
+}
+
 fn canonical(p: PathBuf) -> PathBuf {
     p.canonicalize().unwrap_or(p)
 }
 
-impl PermissionClassifier for tandem_sandbox::Classifier {
-    fn classify(&self, call: &ToolCall) -> (RiskClass, String) {
-        tandem_sandbox::Classifier::classify(self, call)
-    }
-}
-
-fn hard_denied(k: &str) -> bool {
-    HARD_DENY.contains(&k) || HARD_DENY_PREFIXES.iter().any(|p| k.starts_with(p))
-}
-
-fn passthrough(policy: &Policy, k: &str) -> bool {
-    policy
-        .env_passthrough
-        .iter()
-        .any(|p| match p.strip_suffix('*') {
-            Some(prefix) => !prefix.is_empty() && k.starts_with(prefix),
-            None => p == k,
-        })
-}
-
-/// Enclosing-agent session markers and credential-looking names.
-fn session_or_secret(k: &str) -> bool {
-    let u = k.to_uppercase();
-    u == "CLAUDECODE"
-        || u.starts_with("CLAUDE_CODE_")
-        || u == "CLAUDE_PID"
-        || ["_SECRET", "_TOKEN", "_KEY", "_PASSWORD"]
-            .iter()
-            .any(|s| u.ends_with(s))
-        || ["SECRET", "TOKEN", "PASSWORD", "PRIVATE_KEY"]
-            .iter()
-            .any(|s| u.contains(s))
-}
-
-/// The agent's own API key (`ANTHROPIC_API_KEY` for claude...), which the spec lets it
-/// inherit so API-key users can authenticate.
-fn own_api_key(k: &str, desc: &AgentDescriptor) -> bool {
-    let (prefixes, _) = tandem_sandbox::env::vendor_vars(desc);
-    k.ends_with("_API_KEY") && prefixes.iter().any(|p| k.starts_with(p))
-}
-
-/// Child environment: [`tandem_sandbox::env::scrub`], then session markers
-/// (`CLAUDECODE`, `CLAUDE_CODE_*`) and `*_SECRET` / `*_TOKEN` / `*_KEY` names removed
-/// unless listed in `policy.env_passthrough` (the agent's own `<VENDOR>_API_KEY`
-/// survives), then `overrides`.
+/// Child environment: [`tandem_sandbox::env::scrub`], then the descriptor's `strict_env`
+/// (when `strict`), then `overrides` (code-injection names still refused).
 pub fn child_env(
     parent: &HashMap<String, String>,
     policy: &Policy,
     desc: &AgentDescriptor,
+    strict: bool,
     overrides: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut env = tandem_sandbox::env::scrub(parent, policy, desc);
-    env.retain(|k, _| {
-        desc.env.contains_key(k)
-            || passthrough(policy, k)
-            || own_api_key(k, desc)
-            || !session_or_secret(k)
-    });
-    if strict_enabled(overrides) {
-        env.extend(strict_launch(desc).env);
+    if strict {
+        env.extend(desc.strict_env.clone());
     }
     for (k, v) in overrides {
         if !hard_denied(k) && !k.is_empty() && !k.contains('=') && !k.contains('\0') {
@@ -124,69 +94,6 @@ pub fn child_env(
         }
     }
     env
-}
-
-/// `env_overrides` key that turns strict permission launch off when set to `0`, `false`
-/// or `off`. Strict launch is on by default.
-pub const STRICT_PERMISSIONS_VAR: &str = "TANDEM_STRICT_PERMISSIONS";
-
-/// Extra launch arguments and environment that put one agent into a mode where shell
-/// commands and out-of-worktree writes are sent as ACP `session/request_permission`
-/// instead of being auto-approved inside the agent (so Tandem's classifier and UI see them).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StrictLaunch {
-    /// Appended after the descriptor's own args.
-    pub args: Vec<String>,
-    /// Set after env scrubbing, before `SpawnOptions::env_overrides`.
-    pub env: BTreeMap<String, String>,
-}
-
-/// OpenCode inline config (`OPENCODE_CONFIG_CONTENT`). It sits above project
-/// `opencode.json` in OpenCode's precedence, so a file the agent writes into the
-/// worktree cannot loosen it, and it needs no file under `.tandem/`.
-pub const OPENCODE_STRICT_CONFIG: &str = r#"{"permission":{"bash":"ask","edit":"allow","webfetch":"ask","external_directory":"ask"}}"#;
-
-/// Strict-permission launch settings for a built-in agent id. Sources:
-/// - codex: `codex-acp` modes (`INITIAL_AGENT_MODE`; its default `agent` mode lets a
-///   reviewer model auto-approve, `workspace-write` is `on-request` + user reviewer);
-///   github.com/agentclientprotocol/codex-acp README "Runtime options".
-/// - opencode: <https://opencode.ai/docs/permissions/>, <https://opencode.ai/docs/config/>.
-/// - goose: `GOOSE_MODE=approve` (default is `auto`).
-/// - gemini: `--approval-mode default` (not `auto_edit` / `yolo`).
-/// - claude (claude-agent-acp) and the rest: untouched; Claude's default mode asks.
-pub fn strict_launch(desc: &AgentDescriptor) -> StrictLaunch {
-    let env = |pairs: &[(&str, &str)]| {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    };
-    match desc.id.as_str() {
-        "codex" => StrictLaunch {
-            args: vec![],
-            env: env(&[("INITIAL_AGENT_MODE", "workspace-write")]),
-        },
-        "opencode" => StrictLaunch {
-            args: vec![],
-            env: env(&[("OPENCODE_CONFIG_CONTENT", OPENCODE_STRICT_CONFIG)]),
-        },
-        "goose" => StrictLaunch {
-            args: vec![],
-            env: env(&[("GOOSE_MODE", "approve")]),
-        },
-        "gemini" => StrictLaunch {
-            args: vec!["--approval-mode".into(), "default".into()],
-            env: BTreeMap::new(),
-        },
-        _ => StrictLaunch::default(),
-    }
-}
-
-fn strict_enabled(env: &BTreeMap<String, String>) -> bool {
-    !matches!(
-        env.get(STRICT_PERMISSIONS_VAR).map(String::as_str),
-        Some("0" | "false" | "off")
-    )
 }
 
 /// Seatbelt spec for an agent: project + worktree, the agent's own config dirs,
@@ -198,7 +105,7 @@ pub fn sandbox_spec(
     path_var: Option<&str>,
 ) -> SandboxSpec {
     let mut spec = SandboxSpec::new(&opts.project_root, &opts.cwd, home);
-    spec.agent_home_dirs = SandboxSpec::default_agent_home_dirs(desc.id.as_str(), home);
+    spec.agent_home_dirs = SandboxSpec::default_agent_home_dirs(desc, home);
     spec.protected_extra = opts.policy.protected_paths.clone();
     spec.network = true;
     // npm/npx: `~/.npm` (cache, `_npx` installs, logs) and `~/.cache` are already in the
@@ -223,8 +130,8 @@ pub fn launch_command(
     env: &BTreeMap<String, String>,
 ) -> (String, Vec<String>) {
     let mut desc = desc.clone();
-    if strict_enabled(env) {
-        desc.args.extend(strict_launch(&desc).args);
+    if opts.strict_permissions {
+        desc.args.extend(desc.strict_args.clone());
     }
     let desc = &desc;
     if !opts.sandbox {
@@ -233,8 +140,7 @@ pub fn launch_command(
     let home = env
         .get("HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("/var/empty"));
+        .unwrap_or_else(tandem_core::fs::home);
     let spec = sandbox_spec(desc, opts, &home, env.get("PATH").map(String::as_str));
     // Resolve against the scrubbed PATH: sandbox-exec runs `execvp` with its own env.
     let cmd = crate::registry::which_in(
@@ -261,18 +167,10 @@ pub fn reset_stop() {
 mod tests {
     use super::*;
 
+    /// The built-in descriptor (capabilities included) with `command` = `/bin/sh`.
     fn desc(id: &str) -> AgentDescriptor {
-        AgentDescriptor {
-            id: id.into(),
-            display_name: id.into(),
-            vendor: String::new(),
-            command: "/bin/sh".into(),
-            args: vec![],
-            env: BTreeMap::new(),
-            install_hint: String::new(),
-            acp: true,
-            auth_note: String::new(),
-        }
+        let base = crate::registry::get(id).unwrap_or_else(|| AgentDescriptor { id: id.into(), display_name: id.into(), acp: true, ..Default::default() });
+        AgentDescriptor { command: "/bin/sh".into(), args: vec![], ..base }
     }
 
     #[test]
@@ -295,7 +193,7 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
         let mut policy = Policy::default();
-        let e = child_env(&parent, &policy, &desc("claude"), &BTreeMap::new());
+        let e = child_env(&parent, &policy, &desc("claude"), true, &BTreeMap::new());
         for k in ["PATH", "HOME", "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY"] {
             assert!(e.contains_key(k), "missing {k}");
         }
@@ -317,30 +215,10 @@ mod tests {
             ("DYLD_INSERT_LIBRARIES".to_string(), "/evil".to_string()),
         ]
         .into();
-        let e = child_env(&parent, &policy, &desc("claude"), &overrides);
+        let e = child_env(&parent, &policy, &desc("claude"), true, &overrides);
         assert!(e.contains_key("CLAUDE_CODE_OAUTH_TOKEN") && e.contains_key("TANDEM_CANARY_SECRET"));
         assert_eq!(e.get("X").map(String::as_str), Some("1"));
         assert!(!e.contains_key("DYLD_INSERT_LIBRARIES") && !e.contains_key("CLAUDECODE"));
-    }
-
-    #[test]
-    fn strict_launch_per_agent() {
-        let c = strict_launch(&desc("codex"));
-        assert!(c.args.is_empty());
-        assert_eq!(c.env["INITIAL_AGENT_MODE"], "workspace-write");
-        let o = strict_launch(&desc("opencode"));
-        let cfg: serde_json::Value = serde_json::from_str(&o.env["OPENCODE_CONFIG_CONTENT"]).unwrap();
-        assert_eq!(cfg["permission"]["bash"], "ask");
-        assert_eq!(cfg["permission"]["edit"], "allow");
-        assert_eq!(cfg["permission"]["webfetch"], "ask");
-        assert_eq!(cfg["permission"]["external_directory"], "ask");
-        assert_eq!(strict_launch(&desc("goose")).env["GOOSE_MODE"], "approve");
-        let g = strict_launch(&desc("gemini"));
-        assert_eq!(g.args, ["--approval-mode", "default"]);
-        assert!(g.env.is_empty());
-        for id in ["claude", "kiro", "fake"] {
-            assert_eq!(strict_launch(&desc(id)), StrictLaunch::default(), "{id}");
-        }
     }
 
     #[test]
@@ -350,12 +228,14 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let policy = Policy::default();
-        let e = child_env(&parent, &policy, &desc("goose"), &BTreeMap::new());
+        let e = child_env(&parent, &policy, &desc("goose"), true, &BTreeMap::new());
         assert_eq!(e["GOOSE_MODE"], "approve");
-        let off: BTreeMap<String, String> =
-            [(STRICT_PERMISSIONS_VAR.to_string(), "0".to_string())].into();
-        let e = child_env(&parent, &policy, &desc("goose"), &off);
+        let e = child_env(&parent, &policy, &desc("goose"), false, &BTreeMap::new());
         assert_eq!(e["GOOSE_MODE"], "auto");
+        assert_eq!(child_env(&parent, &policy, &desc("codex"), true, &BTreeMap::new())["INITIAL_AGENT_MODE"], "workspace-write");
+        for id in ["claude", "kiro"] {
+            assert!(desc(id).strict_args.is_empty() && desc(id).strict_env.is_empty(), "{id}");
+        }
     }
 
     #[test]
@@ -369,8 +249,8 @@ mod tests {
         let (prog, args) = launch_command(&d, &opts, &env);
         assert_eq!(prog, "gemini");
         assert_eq!(args, ["--acp", "--approval-mode", "default"]);
-        let off = [(STRICT_PERMISSIONS_VAR.to_string(), "off".to_string())].into();
-        assert_eq!(launch_command(&d, &opts, &off).1, ["--acp"]);
+        opts.strict_permissions = false;
+        assert_eq!(launch_command(&d, &opts, &env).1, ["--acp"]);
     }
 
     #[test]

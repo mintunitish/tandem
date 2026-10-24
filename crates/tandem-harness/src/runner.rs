@@ -59,21 +59,23 @@ pub enum Decision {
     Reject,
 }
 
-/// Picks the option id matching `decision`, preferring "once" over "always".
+impl Decision {
+    /// The option kind this decision prefers ("once"; "always" is the fallback).
+    pub fn kind(self) -> PermissionOptionKind {
+        match self {
+            Decision::Allow => PermissionOptionKind::AllowOnce,
+            Decision::Reject => PermissionOptionKind::RejectOnce,
+        }
+    }
+}
+
+/// Picks the option id matching `decision`, preferring "once" over "always" (the same
+/// mapping as `AgentHandle::respond_choice`: [`PermissionRequest::option_for`]).
 pub fn choose_option(req: &PermissionRequest, decision: Decision) -> PermissionDecision {
-    use PermissionOptionKind::*;
-    let prefs: &[PermissionOptionKind] = match decision {
-        Decision::Allow => &[AllowOnce, AllowAlways],
-        Decision::Reject => &[RejectOnce, RejectAlways],
-    };
-    let id = prefs
-        .iter()
-        .find_map(|k| req.options.iter().find(|o| o.kind == *k))
-        .map(|o| o.id.clone())
-        .unwrap_or_else(|| match decision {
-            Decision::Allow => "allow".into(),
-            Decision::Reject => "reject".into(),
-        });
+    let id = req.option_for(decision.kind()).map(|o| o.id.clone()).unwrap_or_else(|| match decision {
+        Decision::Allow => "allow".into(),
+        Decision::Reject => "reject".into(),
+    });
     PermissionDecision { request: req.id.clone(), option_id: id }
 }
 
@@ -195,11 +197,6 @@ impl MockRunner {
     /// Script used for every prompt sent to `agent` (unless a prompt-specific one matches).
     pub fn script(mut self, agent: &str, steps: Vec<MockStep>) -> Self {
         self.scripts.push(MockScript { agent: agent.into(), prompt_contains: None, steps });
-        self
-    }
-    /// Script used when the prompt contains `needle`. Checked before agent-wide scripts.
-    pub fn script_for(mut self, agent: &str, needle: &str, steps: Vec<MockStep>) -> Self {
-        self.scripts.push(MockScript { agent: agent.into(), prompt_contains: Some(needle.into()), steps });
         self
     }
     pub fn from_yaml(text: &str) -> anyhow::Result<Self> {
@@ -327,7 +324,7 @@ impl AgentRunner for MockRunner {
                             .options
                             .iter()
                             .find(|o| o.id == d.option_id)
-                            .is_some_and(|o| matches!(o.kind, PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways));
+                            .is_some_and(|o| o.kind.is_allow());
                         if !allowed {
                             call.status = ToolStatus::Failed;
                             call.content = Some("permission denied".into());

@@ -2,10 +2,9 @@
 //!
 //! cargo run -p tandem-acp --example acp_demo -- --agent codex --cwd . --prompt "Reply with pong" [--auto-approve]
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
-use tandem_acp::{AcpAgent, registry};
-use tandem_core::{AgentEvent, Decider, PermissionDecision, PermissionOptionKind, TaskId};
+use tandem_acp::{AcpAgent, SpawnOptions, registry};
+use tandem_core::{AgentEvent, Decider, PermissionOptionKind, TaskId};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -42,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("launching {} {:?}", desc.command, desc.args);
 
     let (tx, rx) = tandem_core::unbounded();
-    let handle = AcpAgent::spawn(&desc, cwd, BTreeMap::new(), vec![], tx, TaskId::new()).await?;
+    let handle = AcpAgent::spawn(&desc, SpawnOptions::unsandboxed(cwd), tx, TaskId::new()).await?;
     let printer = async {
         while let Ok(ev) = rx.recv().await {
             match ev.event {
@@ -55,42 +54,11 @@ async fn main() -> anyhow::Result<()> {
                         p.tool_call.raw_input,
                         p.options.iter().map(|o| &o.id).collect::<Vec<_>>()
                     );
-                    let wanted = if auto {
-                        [
-                            PermissionOptionKind::AllowOnce,
-                            PermissionOptionKind::AllowAlways,
-                        ]
-                    } else {
-                        [
-                            PermissionOptionKind::RejectOnce,
-                            PermissionOptionKind::RejectAlways,
-                        ]
-                    };
-                    let choice = p
-                        .options
-                        .iter()
-                        .find(|o| wanted.contains(&o.kind))
-                        .map(|o| o.id.clone());
-                    match choice {
-                        Some(option_id) => {
-                            println!(
-                                "[permission] {} -> {option_id}",
-                                if auto { "auto-approve" } else { "reject" }
-                            );
-                            if let Err(e) = handle
-                                .respond_permission(
-                                    PermissionDecision {
-                                        request: p.id,
-                                        option_id,
-                                    },
-                                    Decider::User,
-                                )
-                                .await
-                            {
-                                eprintln!("respond failed: {e}");
-                            }
-                        }
-                        None => handle.cancel().await,
+                    let kind = if auto { PermissionOptionKind::AllowOnce } else { PermissionOptionKind::RejectOnce };
+                    println!("[permission] {}", if auto { "auto-approve" } else { "reject" });
+                    if let Err(e) = handle.respond_choice(&p, kind, Decider::User).await {
+                        eprintln!("respond failed: {e}");
+                        handle.cancel().await;
                     }
                 }
                 other => println!("\n{}", serde_json::to_string(&other).unwrap_or_default()),

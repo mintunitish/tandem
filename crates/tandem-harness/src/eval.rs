@@ -30,10 +30,8 @@ pub struct EvalCtx<'a> {
 
 /// Resolves a check path: `~/` → $HOME, absolute stays, else relative to `work`.
 pub fn resolve(work: &Path, p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(rest);
+    if let Some(rest) = p.strip_prefix("~/") {
+        return tandem_core::fs::home().join(rest);
     }
     let pb = PathBuf::from(p);
     if pb.is_absolute() { pb } else { work.join(pb) }

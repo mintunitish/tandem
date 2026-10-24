@@ -9,10 +9,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use tandem_acp::McpServerSpec;
+use tandem_core::McpServerSpec;
+use tandem_db::MCP_BIN;
 use tandem_sandbox::{PinStatus, PinStore};
-
-pub const MCP_BIN: &str = "tandem-db-mcp";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Exposure {
@@ -30,8 +29,13 @@ fn path(root: &Path) -> PathBuf {
     root.join(".tandem").join("db-agents.json")
 }
 
-pub fn server_name(conn: &str) -> String {
-    format!("tandem-db-{conn}")
+pub use tandem_db::server_name;
+
+/// Policy for statements the user runs in the Database panel: everything allowed, dangerous
+/// statements only after the panel's red-card dialog. `confirmed` is that dialog's answer
+/// for this statement; the closure is the panel's interactive confirmer.
+pub fn panel_policy(confirmed: bool) -> tandem_db::McpPolicy {
+    tandem_db::McpPolicy::new(true, true, true, Box::new(move |_: &str, _: &str| confirmed))
 }
 
 impl DbAgents {
@@ -62,25 +66,15 @@ impl DbAgents {
     }
 }
 
-/// `tandem-db-mcp` next to the running binary (cargo / app bundle), else on PATH.
-pub fn mcp_binary() -> Option<PathBuf> {
-    let beside = std::env::current_exe().ok().and_then(|e| {
-        let dir = e.parent()?.to_path_buf();
-        // Test binaries live in target/<profile>/deps.
-        [dir.join(MCP_BIN), dir.parent()?.join(MCP_BIN)].into_iter().find(|p| p.is_file())
-    });
-    beside.or_else(|| tandem_acp::registry::which_in(MCP_BIN, std::env::var_os("PATH").as_deref().unwrap_or_default()))
-}
-
 /// MCP servers for a new task plus human notes for the transcript.
 pub fn mcp_specs(root: &Path) -> (Vec<McpServerSpec>, Vec<String>) {
     let cfg = DbAgents::load(root);
     if cfg.connections.is_empty() {
         return (vec![], vec![]);
     }
-    let Some(bin) = mcp_binary() else {
+    if tandem_db::mcp_binary().is_none() {
         return (vec![], vec![format!("database not attached: `{MCP_BIN}` not found (build it with `cargo build -p tandem-db`)")]);
-    };
+    }
     let pins = PinStore::open(root).ok();
     let tools = tandem_db::tool_definitions_json();
     let (mut specs, mut notes) = (vec![], vec![]);
@@ -92,16 +86,8 @@ pub fn mcp_specs(root: &Path) -> (Vec<McpServerSpec>, Vec<String>) {
             notes.push(format!("database `{name}` not attached: its MCP tool definitions changed since you approved them"));
             continue;
         }
-        let mut args = vec!["--connection".to_string(), name.clone()];
-        if exp.allow_write {
-            args.push("--allow-write".into());
-        }
-        let mut env = BTreeMap::new();
-        if let Some(store) = std::env::var_os("TANDEM_DB_STORE") {
-            env.insert("TANDEM_DB_STORE".to_string(), store.to_string_lossy().into_owned());
-        }
         notes.push(format!("database `{name}` attached via MCP ({})", if exp.allow_write { "read + write" } else { "read-only" }));
-        specs.push(McpServerSpec { name: server, command: bin.clone(), args, env });
+        specs.push(tandem_db::server_spec(&name, exp.allow_write, false));
     }
     (specs, notes)
 }

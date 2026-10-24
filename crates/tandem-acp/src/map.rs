@@ -219,16 +219,19 @@ impl UpdateMapper {
                     })
                     .collect(),
             },
-            // ACP reports cumulative session cost; core::Usage is additive, so emit the delta.
+            // Context fill is a gauge (latest wins). ACP reports cumulative session cost;
+            // core::Usage cost is additive, so emit the delta.
             acp::SessionUpdate::UsageUpdate(uu) => {
                 let cost = uu
                     .cost
                     .as_ref()
-                    .filter(|c| c.currency.eq_ignore_ascii_case("USD"))?
-                    .amount;
-                let delta = cost - self.last_cost.replace(cost).unwrap_or(0.0);
+                    .filter(|c| c.currency.eq_ignore_ascii_case("USD"))
+                    .map(|c| c.amount);
+                let cost_usd = cost.map(|c| c - self.last_cost.replace(c).unwrap_or(0.0));
                 E::Usage(core::Usage {
-                    cost_usd: Some(delta),
+                    cost_usd,
+                    context_used: Some(uu.used),
+                    context_size: Some(uu.size),
                     ..Default::default()
                 })
             }
@@ -243,7 +246,7 @@ pub(crate) fn end_turn_usage(u: &acp::Usage) -> core::Usage {
         output_tokens: u.output_tokens,
         cache_read_tokens: u.cached_read_tokens.unwrap_or(0),
         cache_write_tokens: u.cached_write_tokens.unwrap_or(0),
-        cost_usd: None,
+        ..Default::default()
     }
 }
 
@@ -311,12 +314,11 @@ mod tests {
             panic!()
         };
         assert_eq!(us.cost_usd, Some(0.25));
-        assert!(
-            m.map(&update(
-                json!({"sessionUpdate":"usage_update","used":1,"size":2})
-            ))
-            .is_none()
-        );
+        assert_eq!((us.context_used, us.context_size), (Some(1), Some(2)));
+        let Some(core::AgentEvent::Usage(us)) = m.map(&update(json!({"sessionUpdate":"usage_update","used":7,"size":9}))) else {
+            panic!()
+        };
+        assert_eq!((us.cost_usd, us.context_used, us.context_size), (None, Some(7), Some(9)));
     }
 
     #[test]

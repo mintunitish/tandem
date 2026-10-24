@@ -181,8 +181,7 @@ impl Requires {
 }
 
 pub fn which(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| p.is_file())
+    tandem_core::fs::which_in(bin, &std::env::var_os("PATH")?)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

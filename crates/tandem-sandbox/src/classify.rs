@@ -151,11 +151,16 @@ const SAFE_PURE: &[&str] = &[
     "popd", "wait", "yes", "expr",
 ];
 
+impl tandem_core::PermissionClassifier for Classifier {
+    fn classify(&self, call: &ToolCall) -> (RiskClass, String) {
+        Classifier::classify(self, call)
+    }
+}
+
 impl Classifier {
     /// Uses `$HOME` from the environment.
     pub fn new(policy: Policy, project_root: impl Into<PathBuf>, worktree_root: impl Into<PathBuf>) -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/var/empty"));
-        Self::with_home(policy, project_root, worktree_root, home)
+        Self::with_home(policy, project_root, worktree_root, tandem_core::fs::home())
     }
 
     pub fn with_home(
