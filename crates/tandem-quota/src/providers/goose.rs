@@ -47,7 +47,11 @@ pub struct GooseProvider {
 
 impl GooseProvider {
     pub fn new(db: Option<PathBuf>) -> Self {
-        Self { core: ProviderCore::new(AGENT.into()), db }
+        Self::for_agent(AGENT.into(), db)
+    }
+    /// Provider reporting under `agent` (the descriptor's id).
+    pub fn for_agent(agent: tandem_core::AgentId, db: Option<PathBuf>) -> Self {
+        Self { core: ProviderCore::new(agent), db }
     }
     /// Re-reads the database. Errors are recorded in the snapshot.
     pub fn refresh(&self) {

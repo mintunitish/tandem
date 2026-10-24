@@ -36,6 +36,9 @@ fn is_staged(e: &StatusEntry) -> bool {
 
 /// Status is re-read this long after the last save / filesystem change.
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Slow poll for changes the watcher does not see (git commands run outside Tandem touch
+/// `.git/`, which is not watched).
+const REFRESH_POLL: Duration = Duration::from_secs(15);
 
 /// Run `git <args>` in `root`, returning combined stdout+stderr and success.
 pub fn git_cli(root: &Path, args: &[&str]) -> (bool, String) {
@@ -59,6 +62,10 @@ pub struct CommitPanel {
     error: Option<String>,
     editor: WeakEntity<EditorArea>,
     refresh_task: Task<()>,
+    /// A status read is running; `refresh_again` asks for one more when it finishes.
+    refreshing: bool,
+    refresh_again: bool,
+    _poll: Task<()>,
     _subs: Vec<Subscription>,
 }
 
@@ -87,6 +94,16 @@ impl CommitPanel {
             error: None,
             editor: editor.downgrade(),
             refresh_task: Task::ready(()),
+            refreshing: false,
+            refresh_again: false,
+            _poll: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(REFRESH_POLL).await;
+                    if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
+                        break;
+                    }
+                }
+            }),
             _subs: subs,
         };
         this.refresh(cx);
@@ -101,12 +118,23 @@ impl CommitPanel {
         });
     }
 
+    /// Re-read `git status` off the UI thread. While a read is in flight further calls
+    /// coalesce into one re-run after it, so changes made meanwhile are not missed.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.refreshing {
+            self.refresh_again = true;
+            return;
+        }
+        self.refreshing = true;
         let root = self.root.clone();
         let task = cx.background_spawn(async move { Repo::open(&root).and_then(|r| r.status()).map_err(|e| e.to_string()) });
         cx.spawn(async move |this, cx| {
             let res = task.await;
             let _ = this.update(cx, |p, cx| {
+                p.refreshing = false;
+                if std::mem::take(&mut p.refresh_again) {
+                    p.refresh(cx);
+                }
                 match res {
                     Ok(mut entries) => {
                         entries.sort_by(|a, b| a.path.cmp(&b.path));

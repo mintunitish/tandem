@@ -83,7 +83,9 @@ impl AgentRunner for AcpRunner {
         let desc = self.descriptor(agent)?;
 
         let task = TaskId::new();
-        let (itx, irx) = async_channel::unbounded::<TaskEvent>();
+        // Bounded: backpressure on the ACP reader if this loop falls behind. Startup events
+        // (drained after `spawn` returns) are far fewer than the capacity.
+        let (itx, irx) = tandem_core::bounded_events(tandem_core::EVENT_CAPACITY);
         let forward = |event: AgentEvent| {
             let (tx, task) = (tx.clone(), task.clone());
             async move { tx.send(TaskEvent { task, event }).await.map_err(|e| anyhow!("event channel closed: {e}")) }

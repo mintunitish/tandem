@@ -167,7 +167,7 @@ impl PinStore {
 
     fn save(&self) -> Result<()> {
         let body = serde_json::to_vec_pretty(&PinFile { version: 1, servers: self.pins.clone() })?;
-        tandem_core::fs::atomic_write(&self.path, &body).with_context(|| format!("writing {}", self.path.display()))
+        tandem_core::fs::atomic_write(&self.path, &body, true).with_context(|| format!("writing {}", self.path.display()))
     }
 }
 

@@ -20,12 +20,48 @@ pub use config::{
 };
 pub use db::{ConnectOptions, Db};
 pub use error::DbError;
-pub use mcp::{ConfirmFile, Confirmer, DenyAll, McpPolicy, TandemDbServer, sql_hash, tool_definitions_json};
+pub use mcp::{APPROVAL_TTL, ConfirmFile, Confirmer, DenyAll, McpPolicy, TandemDbServer, WriterFactory, sql_hash, tool_definitions_json};
 pub use schema::{ColumnInfo, ForeignKey, Index, Table, TableKind, quote_ident};
 pub use value::{Column, QueryOptions, QueryResult, StreamItem, Value};
 
 /// Name of the stdio MCP server binary.
 pub const MCP_BIN: &str = "tandem-db-mcp";
+
+/// Env var overriding the connections file (`~/.tandem/db/connections.json`).
+pub const STORE_ENV: &str = "TANDEM_DB_STORE";
+
+/// Filesystem-safe, collision-resistant name for a project: its canonical path with
+/// every non-alphanumeric run turned into `-`, plus a short hash of the full path.
+pub fn project_slug(root: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let s = canon.to_string_lossy();
+    let mut slug = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let tail: String = slug.chars().rev().take(48).collect::<Vec<_>>().into_iter().rev().collect();
+    let hash: String = Sha256::digest(s.as_bytes()).iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{}-{hash}", tail.trim_matches('-'))
+}
+
+/// `~/.tandem/db/confirm/<project-slug>.json`: the user's destructive-SQL approvals for a
+/// project ([`ConfirmFile`]). Outside the repository, so nothing in the project can
+/// pre-approve statements.
+pub fn confirm_path(root: &std::path::Path) -> std::path::PathBuf {
+    tandem_core::fs::tandem_home().join("db").join("confirm").join(format!("{}.json", project_slug(root)))
+}
+
+/// `~/.tandem/db/agents-<project-slug>.json`: the user's per-project agent exposure,
+/// the only place write / dangerous access can be granted.
+pub fn user_agents_path(root: &std::path::Path) -> std::path::PathBuf {
+    tandem_core::fs::tandem_home().join("db").join(format!("agents-{}.json", project_slug(root)))
+}
 
 /// `tandem-db-mcp` next to the running binary (cargo target dir / app bundle), else on PATH.
 pub fn mcp_binary() -> Option<std::path::PathBuf> {
@@ -52,8 +88,8 @@ pub fn server_spec(connection: &str, allow_write: bool, allow_ddl: bool) -> tand
     if allow_ddl {
         args.push("--allow-ddl".into());
     }
-    let env = std::env::var_os("TANDEM_DB_STORE")
-        .map(|s| [("TANDEM_DB_STORE".to_string(), s.to_string_lossy().into_owned())].into())
+    let env = std::env::var_os(STORE_ENV)
+        .map(|s| [(STORE_ENV.to_string(), s.to_string_lossy().into_owned())].into())
         .unwrap_or_default();
     tandem_core::McpServerSpec {
         name: server_name(connection),

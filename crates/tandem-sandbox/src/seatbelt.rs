@@ -39,8 +39,14 @@ pub struct SandboxSpec {
     /// Extra writable roots (package caches are pre-filled).
     pub write_roots: Vec<PathBuf>,
     /// The repository's git dir (`<project>/.git`) so commits from the worktree work.
-    /// Writable except `hooks/` and `config`. `None` keeps it read-only.
+    /// Only `objects/`, `worktrees/<task_worktree>/`, `refs/heads/tandem/`,
+    /// `logs/refs/heads/tandem/` and `packed-refs.lock` are writable; hooks, config, the
+    /// main index and every other ref stay read-only. `None` keeps it all read-only.
     pub git_common_dir: Option<PathBuf>,
+    /// Name of the task's git worktree (`<git_common_dir>/worktrees/<name>`), normally
+    /// the worktree directory's name. `None` (the worktree is the project) grants no
+    /// per-worktree admin dir.
+    pub task_worktree: Option<String>,
     /// `Policy.protected_paths`.
     pub protected_extra: Vec<String>,
     /// Allow outbound network (agents need their vendor API).
@@ -121,10 +127,15 @@ impl SandboxSpec {
             temp_dirs.push(t);
         }
         let git = project_root.join(".git");
+        let worktree_root: PathBuf = worktree_root.into();
+        let task_worktree = (worktree_root != project_root)
+            .then(|| worktree_root.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .flatten();
         SandboxSpec {
             git_common_dir: git.is_dir().then_some(git),
+            task_worktree,
             project_root,
-            worktree_root: worktree_root.into(),
+            worktree_root,
             agent_home_dirs: vec![],
             temp_dirs,
             read_roots: SYSTEM_READ.iter().map(PathBuf::from).chain(HOME_READ.iter().map(|r| home.join(r))).collect(),
@@ -133,6 +144,17 @@ impl SandboxSpec {
             protected_extra: vec![],
             network: true,
         }
+    }
+
+    /// Paths inside [`SandboxSpec::git_common_dir`] a task may write: what `git commit` on
+    /// the task's `tandem/<id>` branch touches, nothing that runs code or moves other refs.
+    pub fn git_write_paths(&self) -> Vec<PathBuf> {
+        let Some(g) = &self.git_common_dir else { return vec![] };
+        let mut v = vec![g.join("objects"), g.join("refs/heads/tandem"), g.join("logs/refs/heads/tandem")];
+        if let Some(name) = self.task_worktree.as_deref().filter(|n| !n.is_empty() && *n != "." && *n != ".." && !n.contains('/')) {
+            v.push(g.join("worktrees").join(name));
+        }
+        v
     }
 
     /// The agent's own config dirs (`AgentDescriptor::home_dirs`) under `home`, e.g. `~/.codex`.
@@ -313,10 +335,12 @@ pub fn profile(spec: &SandboxSpec) -> String {
     writes.extend(spec.temp_dirs.iter().cloned());
     writes.extend(spec.agent_home_dirs.iter().cloned());
     writes.extend(spec.write_roots.iter().cloned());
-    if let Some(g) = &spec.git_common_dir {
-        writes.push(g.clone());
-    }
+    writes.extend(spec.git_write_paths());
     p.push_str(&format!("\n; --- filesystem: writes\n(allow file-read* file-write*{})\n", subpaths(&writes)));
+    if let Some(g) = &spec.git_common_dir {
+        let lock = g.join("packed-refs.lock");
+        p.push_str(&format!("(allow file-write*{})\n", spellings(&lock).iter().map(|l| format!(" (literal {})", q(l))).collect::<String>()));
+    }
 
     // Tandem's control directory stays read-only even when the worktree is the project.
     let tandem = spec.project_root.join(".tandem");
@@ -585,5 +609,77 @@ mod tests {
         let out = run(&s, "/bin/sh", &["-c", &script]);
         assert!(out.status.success(), "sh failed: {}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
+    }
+
+    #[test]
+    fn git_common_dir_writes_are_narrow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let s = SandboxSpec::new(&project, project.join(".tandem/worktrees/t1"), "/Users/u");
+        assert_eq!(s.task_worktree.as_deref(), Some("t1"));
+        let g = project.join(".git");
+        assert_eq!(s.git_write_paths(), [g.join("objects"), g.join("refs/heads/tandem"), g.join("logs/refs/heads/tandem"), g.join("worktrees/t1")]);
+        let writes = profile(&s);
+        let writes = writes.split("filesystem: writes").nth(1).unwrap().split("tandem state").next().unwrap();
+        assert!(!writes.contains(&format!("(subpath {})", q(&g))), "whole git dir must not be writable");
+        assert!(writes.contains("packed-refs.lock"));
+        // Worktree == project: no per-worktree admin dir.
+        assert_eq!(SandboxSpec::new(&project, &project, "/Users/u").task_worktree, None);
+    }
+
+    /// Inside the profile `git commit` in the task worktree works, but hooks and config
+    /// in the shared git dir stay read-only.
+    #[test]
+    fn sandboxed_git_commit_but_no_hooks() {
+        if !sandbox_works() || !Path::new("/usr/bin/git").exists() {
+            eprintln!("skipping: sandbox-exec or git unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let project = dir.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            Command::new("/usr/bin/git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"])
+                .args(args)
+                .current_dir(cwd)
+                .env("HOME", &dir)
+                .output()
+                .unwrap()
+        };
+        let probe = git(&project, &["init", "-q"]);
+        if !probe.status.success() {
+            eprintln!("skipping: git unusable: {}", String::from_utf8_lossy(&probe.stderr));
+            return;
+        }
+        std::fs::write(project.join("a.txt"), "a\n").unwrap();
+        assert!(git(&project, &["add", "a.txt"]).status.success());
+        assert!(git(&project, &["commit", "-qm", "init"]).status.success());
+        let wt = project.join(".tandem/worktrees/t1");
+        let out = git(&project, &["worktree", "add", "-q", "-b", "tandem/t1", wt.to_str().unwrap()]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let mut s = SandboxSpec::new(&project, &wt, &dir);
+        // The test repo lives under $TMPDIR; keep only /tmp writable so the checks below
+        // exercise the git rules, not the temp-dir allowance.
+        s.temp_dirs.retain(|t| t.starts_with("/tmp") || t.starts_with("/private/tmp"));
+        let common = project.join(".git");
+        let script = format!(
+            "cd {} && echo b > b.txt && /usr/bin/git add b.txt && /usr/bin/git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -qm agent",
+            q(&wt)
+        );
+        let args: Vec<String> = vec!["-c".into(), script];
+        let (prog, a) = wrap_command(&s, "/bin/sh", &args);
+        let out = Command::new(prog).args(a).env_clear().env("PATH", "/usr/bin:/bin").env("HOME", &dir).env("TMPDIR", "/tmp").output().unwrap();
+        assert!(out.status.success(), "sandboxed git commit failed: {}", String::from_utf8_lossy(&out.stderr));
+        let log = git(&project, &["log", "--format=%s", "-1", "tandem/t1"]);
+        assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "agent");
+
+        for target in [common.join("hooks/pre-commit"), common.join("config"), common.join("refs/heads/main"), common.join("index")] {
+            let out = run(&s, "/bin/sh", &["-c", &format!("echo x >> {}", q(&target))]);
+            assert!(!out.status.success(), "{} must not be writable", target.display());
+        }
     }
 }

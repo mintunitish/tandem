@@ -1,8 +1,9 @@
 //! Settings dialog (⌘,): Appearance (theme, editor font size), Keymap (read-only table built
-//! from `keymap::entries`) and Agents (the project's `.tandem/policy.json`).
+//! from `keymap::entries`) and Agents (the user's `~/.tandem/policy.json`; a project's
+//! `.tandem/policy.json` can only tighten it).
 
 use crate::keymap;
-use crate::state::{AppSettings, load_policy, save_policy};
+use crate::state::{AppSettings, load_user_policy, tandem_home};
 use crate::theme::{self, ThemeKind, pal};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::switch::Switch;
@@ -31,14 +32,14 @@ impl Page {
 
 pub struct SettingsView {
     page: Page,
-    project: PathBuf,
+    _project: PathBuf,
+    /// The user-level policy (what this page edits).
     policy: tandem_core::Policy,
 }
 
 impl SettingsView {
     pub fn new(project: PathBuf) -> Self {
-        let policy = load_policy(&project);
-        Self { page: Page::Appearance, project, policy }
+        Self { page: Page::Appearance, _project: project, policy: load_user_policy() }
     }
 
     fn set_theme(&mut self, kind: ThemeKind, cx: &mut Context<Self>) {
@@ -60,7 +61,7 @@ impl SettingsView {
     }
 
     fn save_policy(&mut self, cx: &mut Context<Self>) {
-        save_policy(&self.project, &self.policy);
+        crate::state::save_user_policy(&self.policy);
         cx.notify();
     }
 }
@@ -181,7 +182,7 @@ impl Render for SettingsView {
                             .text_color(p.text)
                             .child("Destructive commands (rm -rf, git push --force, git reset --hard, DROP/TRUNCATE, curl | sh) always require a red-card approval. This cannot be turned off."),
                     )
-                    .child(div().text_size(px(12.)).text_color(p.muted).child(format!("Stored in {}", self.project.join(".tandem/policy.json").display())))
+                    .child(div().text_size(px(12.)).text_color(p.muted).child(format!("Stored in {} (a project's .tandem/policy.json can only tighten it)", tandem_home().join("policy.json").display())))
                     .into_any_element()
             }
         };

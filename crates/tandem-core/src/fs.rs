@@ -4,17 +4,19 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Atomically replaces `path` with `bytes`: writes a uniquely named temp file in the same
-/// directory, fsyncs it, then renames it over the target. Creates the parent directory.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_impl(path, bytes, None)
+/// directory, fsyncs it when `sync`, then renames it over the target. Creates the parent
+/// directory. Without `sync` a crash can lose the new contents but never leaves a torn file
+/// on most filesystems; use it for frequently rewritten, reconstructible state.
+pub fn atomic_write(path: &Path, bytes: &[u8], sync: bool) -> io::Result<()> {
+    write_impl(path, bytes, None, sync)
 }
 
-/// [`atomic_write`] with an explicit file mode (unix permission bits; ignored elsewhere).
+/// [`atomic_write`] (synced) with an explicit file mode (unix permission bits; ignored elsewhere).
 pub fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    write_impl(path, bytes, Some(mode))
+    write_impl(path, bytes, Some(mode), true)
 }
 
-fn write_impl(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
+fn write_impl(path: &Path, bytes: &[u8], mode: Option<u32>, sync: bool) -> io::Result<()> {
     let dir = match path.parent() {
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
@@ -40,7 +42,9 @@ fn write_impl(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
         }
         #[cfg(not(unix))]
         let _ = mode;
-        f.sync_all()?;
+        if sync {
+            f.sync_all()?;
+        }
         drop(f);
         std::fs::rename(&tmp, path)
     })();
@@ -66,13 +70,18 @@ pub fn tandem_home() -> PathBuf {
         .unwrap_or_else(|| home().join(".tandem"))
 }
 
-/// Resolves an executable name against a PATH value. Names containing `/` are checked directly.
+/// Resolves an executable name against a PATH value. Names containing `/` are checked
+/// directly. Empty and relative PATH entries (`::`, `.`, `bin`) are skipped so a file
+/// planted in the working directory never wins.
 pub fn which_in(cmd: &str, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
     if cmd.contains('/') {
         let p = PathBuf::from(cmd);
         return is_executable(&p).then_some(p);
     }
-    std::env::split_paths(path_var).map(|d| d.join(cmd)).find(|p| is_executable(p))
+    std::env::split_paths(path_var)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(cmd))
+        .find(|p| is_executable(p))
 }
 
 /// True for a regular file with any execute bit set (any regular file off unix).
@@ -96,8 +105,8 @@ mod tests {
     fn atomic_write_replaces_and_sets_mode() {
         let dir = std::env::temp_dir().join(format!("tandem-core-fs-{}", uuid::Uuid::new_v4()));
         let p = dir.join("sub/a.json");
-        atomic_write(&p, b"one").unwrap();
-        atomic_write(&p, b"two").unwrap();
+        atomic_write(&p, b"one", true).unwrap();
+        atomic_write(&p, b"two", false).unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"two");
         #[cfg(unix)]
         {
@@ -108,5 +117,53 @@ mod tests {
         let leftovers = std::fs::read_dir(p.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn exe(p: &Path, mode: u32) {
+        std::fs::write(p, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn which_in_rules() {
+        let root = std::env::temp_dir().join(format!("tandem-core-which-{}", uuid::Uuid::new_v4()));
+        let (a, b, c) = (root.join("a"), root.join("b"), root.join("c"));
+        for d in [&a, &b, &c] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        exe(&a.join("tool"), 0o644); // not executable: skipped
+        std::fs::create_dir_all(b.join("tool")).unwrap(); // a directory: skipped
+        exe(&c.join("tool"), 0o755);
+        let path = std::env::join_paths([&a, &b, &c]).unwrap();
+        assert_eq!(which_in("tool", &path), Some(c.join("tool")));
+        // First hit wins.
+        exe(&b.join("other"), 0o755);
+        exe(&c.join("other"), 0o755);
+        assert_eq!(which_in("other", &path), Some(b.join("other")));
+        // Relative and empty entries are skipped, even when they would match.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = pathdiff_rel(&c, &cwd);
+        let path = std::ffi::OsString::from(format!("::{}:.", rel.display()));
+        assert_eq!(which_in("tool", &path), None);
+        // Names with a slash are checked directly.
+        assert_eq!(which_in(c.join("tool").to_str().unwrap(), std::ffi::OsStr::new("")), Some(c.join("tool")));
+        assert_eq!(which_in("missing", std::ffi::OsStr::new("")), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `to` relative to `from` via `..` components (enough for the test).
+    fn pathdiff_rel(to: &Path, from: &Path) -> PathBuf {
+        let mut rel = PathBuf::new();
+        for _ in from.components().skip(1) {
+            rel.push("..");
+        }
+        rel.join(to.strip_prefix("/").unwrap())
     }
 }

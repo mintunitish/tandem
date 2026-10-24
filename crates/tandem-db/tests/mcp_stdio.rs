@@ -19,7 +19,6 @@ impl Client {
     fn spawn(store: &std::path::Path, extra: &[&str], envs: &[(&str, &str)]) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tandem-db-mcp"));
         cmd.arg("--store").arg(store).arg("--connection").arg("fixture").args(extra);
-        cmd.env_remove("TANDEM_DB_CONFIRM");
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -194,36 +193,43 @@ async fn write_and_dangerous_gates() {
         assert_eq!(c.call("query", json!({"sql": "CREATE TABLE t (a INT)"}))["isError"], json!(true));
         assert_eq!(c.call("query", json!({"sql": "DELETE FROM users"}))["isError"], json!(true));
     }
-    // --allow-dangerous without the confirmation env is still refused (and the connection stays read-only).
+    // --allow-dangerous without --confirm-file: refused (and the connection stays read-only).
     {
-        let mut c = Client::spawn(&store, &["--allow-dangerous"], &[("TANDEM_DB_CONFIRM", "other-connection")]);
+        let mut c = Client::spawn(&store, &["--allow-dangerous"], &[("TANDEM_DB_CONFIRM", "fixture")]);
         let r = c.call("query", json!({"sql": "DROP TABLE notes"}));
         assert_eq!(r["isError"], json!(true), "{r}");
         assert!(text_of(&r).starts_with("refused:"));
     }
-    // --allow-dangerous + --confirm-file: only statements whose hash the IDE approved.
+    // --allow-dangerous + --confirm-file: only statements the IDE approved for this
+    // connection within the TTL, each once; they run on their own writable connection.
     {
         let dir = tempfile::tempdir().unwrap();
         let approvals = dir.path().join("approved.json");
-        std::fs::write(&approvals, serde_json::to_string(&[tandem_db::sql_hash("DELETE FROM notes")]).unwrap()).unwrap();
+        let now = chrono::Utc::now();
+        tandem_db::ConfirmFile::approve(&approvals, "fixture", "DELETE FROM notes", now).unwrap();
+        tandem_db::ConfirmFile::approve(&approvals, "other", "DROP TABLE notes", now).unwrap();
         let file = approvals.to_str().unwrap();
         let mut c = Client::spawn(&store, &["--allow-dangerous", "--confirm-file", file], &[]);
+        // Approved for another connection: refused.
         assert_eq!(c.call("query", json!({"sql": "DROP TABLE notes"}))["isError"], json!(true));
+        // Plain writes stay refused: the main connection is read-only.
+        assert_eq!(c.call("query", json!({"sql": "INSERT INTO users (name) VALUES ('x')"}))["isError"], json!(true));
         let r = c.call("query", json!({"sql": "DELETE FROM notes"}));
         assert_ne!(r["isError"], json!(true), "{r}");
+        // One approval, one execution.
+        let r = c.call("query", json!({"sql": "DELETE FROM notes"}));
+        assert_eq!(r["isError"], json!(true), "{r}");
     }
-    // TANDEM_DB_CONFIRM=<connection> without --allow-dangerous approves nothing.
+    // An expired approval is refused.
     {
-        let mut c = Client::spawn(&store, &[], &[("TANDEM_DB_CONFIRM", "fixture")]);
+        let dir = tempfile::tempdir().unwrap();
+        let approvals = dir.path().join("approved.json");
+        let old = chrono::Utc::now() - chrono::Duration::minutes(16);
+        std::fs::write(&approvals, serde_json::to_string(&[(tandem_db::sql_hash("fixture", "DROP TABLE notes"), old)].into_iter().collect::<std::collections::BTreeMap<_, _>>()).unwrap()).unwrap();
+        let mut c = Client::spawn(&store, &["--allow-dangerous", "--confirm-file", approvals.to_str().unwrap()], &[]);
         assert_eq!(c.call("query", json!({"sql": "DROP TABLE notes"}))["isError"], json!(true));
-    }
-    // --allow-dangerous + TANDEM_DB_CONFIRM=<connection>: legacy approve-all.
-    {
-        let mut c = Client::spawn(&store, &["--allow-dangerous"], &[("TANDEM_DB_CONFIRM", "fixture")]);
-        let r = c.call("query", json!({"sql": "DROP TABLE notes"}));
-        assert_ne!(r["isError"], json!(true), "{r}");
         let r = c.call("list_tables", json!({}));
-        assert_eq!(r["structuredContent"]["tables"].as_array().unwrap().len(), 1, "{r}");
+        assert_eq!(r["structuredContent"]["tables"].as_array().unwrap().len(), 2, "{r}");
     }
 }
 

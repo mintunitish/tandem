@@ -119,4 +119,25 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(matches!(records[1].event, AgentEvent::Done { .. }));
     }
+
+    #[test]
+    fn buffers_deltas_and_flushes_on_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = TaskId::from("t1");
+        let mut log = ReplayLog::open(dir.path()).unwrap();
+        let delta = AgentEvent::TextDelta { role: tandem_core::Role::Assistant, text: "hi".into() };
+        log.record(&task, &delta).unwrap();
+        // Still in the buffer (well within FLUSH_INTERVAL of opening).
+        assert_eq!(ReplayLog::read(dir.path()).unwrap().len(), 0);
+        log.record(&task, &AgentEvent::Done { reason: tandem_core::StopReason::EndTurn }).unwrap();
+        assert_eq!(ReplayLog::read(dir.path()).unwrap().len(), 2, "Done flushes everything");
+        log.record(&task, &delta).unwrap();
+        assert_eq!(ReplayLog::read(dir.path()).unwrap().len(), 2);
+        log.flush().unwrap();
+        assert_eq!(ReplayLog::read(dir.path()).unwrap().len(), 3);
+        // A torn trailing line is skipped.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new().append(true).open(log.path()).unwrap().write_all(b"{\"at\":").unwrap();
+        assert_eq!(ReplayLog::read(dir.path()).unwrap().len(), 3);
+    }
 }

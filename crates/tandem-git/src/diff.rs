@@ -257,3 +257,31 @@ pub fn gutter_marks(old: &str, new: &str) -> Vec<GutterMark> {
     marks.dedup_by_key(|m| m.line);
     marks
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn marks(old: &str, new: &str) -> Vec<(u32, GutterKind)> {
+        gutter_marks(old, new).into_iter().map(|m| (m.line, m.kind)).collect()
+    }
+
+    #[test]
+    fn gutter_marks_kinds_and_dedupe() {
+        assert!(marks("a\nb\n", "a\nb\n").is_empty());
+        assert_eq!(marks("a\nb\n", "a\nX\n"), [(2, GutterKind::Modified)]);
+        assert_eq!(marks("a\n", "a\nb\nc\n"), [(2, GutterKind::Added), (3, GutterKind::Added)]);
+        assert_eq!(marks("a\nb\nc\n", "a\nc\n"), [(2, GutterKind::Removed)]);
+        // A deletion right before an insertion lands on the same line: one mark, and the
+        // insertion wins.
+        let m = marks("a\nb\nc\nd\n", "a\nc\nX\n");
+        let mut lines: Vec<u32> = m.iter().map(|x| x.0).collect();
+        let n = lines.len();
+        lines.dedup();
+        assert_eq!(lines.len(), n, "one mark per line: {m:?}");
+        assert!(lines.windows(2).all(|w| w[0] < w[1]), "sorted: {m:?}");
+        let both = marks("x\ny\n", "y\nz\n");
+        assert_eq!(both.iter().filter(|x| x.0 == 2).count(), 1, "{both:?}");
+        assert!(both.contains(&(2, GutterKind::Added)), "Added beats Removed on a shared line: {both:?}");
+    }
+}

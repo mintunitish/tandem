@@ -90,6 +90,8 @@ pub struct ClaudeOptions {
     pub calibration_path: Option<PathBuf>,
     /// In-memory only: no transcript scans, no calibration file.
     pub offline: bool,
+    /// Agent id the snapshots are reported under (the descriptor's id).
+    pub agent: tandem_core::AgentId,
 }
 impl Default for ClaudeOptions {
     fn default() -> Self {
@@ -97,6 +99,7 @@ impl Default for ClaudeOptions {
             projects_dir: Some(tandem_core::fs::home().join(".claude").join("projects")),
             calibration_path: Some(persist::calibration_path()),
             offline: false,
+            agent: AGENT.into(),
         }
     }
 }
@@ -117,7 +120,7 @@ impl ClaudeProvider {
         }
         let calibration = opts.calibration_path.as_deref().map(Calibration::load).unwrap_or_default();
         Arc::new_cyclic(|me| Self {
-            core: Arc::new(ProviderCore::new(AGENT.into())),
+            core: Arc::new(ProviderCore::new(opts.agent.clone())),
             opts,
             session: Mutex::new(Usage::default()),
             block: Mutex::new(None),

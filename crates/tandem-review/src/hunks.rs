@@ -32,10 +32,7 @@ pub fn diff_texts(path: impl Into<PathBuf>, old: Option<&str>, new: Option<&str>
     }
 }
 
-pub(crate) fn strip_eol(s: &str) -> &str {
-    let s = s.strip_suffix('\n').unwrap_or(s);
-    s.strip_suffix('\r').unwrap_or(s)
-}
+pub(crate) use tandem_core::diff::strip_eol;
 
 /// The path this file had in the base commit (rename source, else `path`).
 pub fn base_path(f: &FileDiff) -> &Path {

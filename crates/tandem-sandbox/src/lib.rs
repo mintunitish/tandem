@@ -9,6 +9,7 @@
 //! See docs/specs/2026-10-24-tandem-design.md, "Security model" and "Kill Switch".
 
 pub mod classify;
+pub mod descriptor;
 pub mod env;
 pub mod kill;
 pub mod mcp_pin;

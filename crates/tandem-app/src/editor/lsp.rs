@@ -19,20 +19,16 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tandem_lsp::lsp_types::{self as lsp, CodeAction, CodeActionOrCommand, CompletionContext, CompletionItem, CompletionResponse, CompletionTextEdit, InsertTextFormat};
-use tandem_lsp::{ChangeDebouncer, ClientKey, LspClient, LspError, LspManager, ManagerEvent, ServerNotification};
+use tandem_lsp::debounce::{DEFAULT_DELAY as CHANGE_DEBOUNCE, DEFAULT_MAX_WAIT as CHANGE_MAX_WAIT};
+use tandem_lsp::{LspClient, LspError, LspManager, ManagerEvent, ServerNotification};
 
 /// Completion items shown at most.
 const MAX_COMPLETIONS: usize = 150;
-/// `didChange` is sent this long after the last edit...
-const CHANGE_DEBOUNCE: Duration = Duration::from_millis(50);
-/// ...or this long after the first edit of a continuous burst.
-const CHANGE_MAX_WAIT: Duration = Duration::from_millis(500);
 
 struct Doc {
     client: Arc<LspClient>,
-    debouncer: ChangeDebouncer,
     version: i32,
     text_hash: u64,
     /// Latest unsynced buffer snapshot (cheap rope clone) and when the burst started.
@@ -50,7 +46,6 @@ pub enum LspHubEvent {
 pub struct LspHub {
     pub manager: Arc<LspManager>,
     docs: HashMap<PathBuf, Doc>,
-    debouncers: HashMap<ClientKey, ChangeDebouncer>,
     starting: HashSet<PathBuf>,
     /// Latest diagnostics per absolute path (only non-empty entries).
     pub diagnostics: BTreeMap<PathBuf, Vec<lsp::Diagnostic>>,
@@ -84,7 +79,6 @@ impl LspHub {
         Self {
             manager,
             docs: HashMap::new(),
-            debouncers: HashMap::new(),
             starting: HashSet::new(),
             diagnostics: BTreeMap::new(),
             progress: HashSet::new(),
@@ -118,7 +112,6 @@ impl LspHub {
                 }
                 ServerNotification::Exited { restarting: false, .. } => {
                     self.docs.retain(|_, d| !d.client.is_dead());
-                    self.debouncers.remove(&key);
                     cx.emit(LspHubEvent::Status);
                 }
                 _ => {}
@@ -189,12 +182,8 @@ impl LspHub {
 
     fn attach(&mut self, path: PathBuf, client: Arc<LspClient>, language_id: &str, text: String) {
         let _rt = runtime::tokio().enter();
-        let key = ClientKey { root: client.root().to_path_buf(), server_id: client.config().id.clone() };
-        // The hub debounces (see `change`); the shared debouncer only serializes and flushes.
-        let debouncer =
-            self.debouncers.entry(key).or_insert_with(|| ChangeDebouncer::with_delay((*client).clone(), Duration::ZERO, Duration::ZERO)).clone();
         let _ = client.did_open(&path, language_id, &text);
-        self.docs.insert(path, Doc { client, debouncer, version: 0, text_hash: hash_text(&text), pending: None, flush: Task::ready(()) });
+        self.docs.insert(path, Doc { client, version: 0, text_hash: hash_text(&text), pending: None, flush: Task::ready(()) });
     }
 
     pub fn is_open(&self, path: &Path) -> bool {
@@ -220,7 +209,8 @@ impl LspHub {
         self.sync_text(path, &rope.to_string());
     }
 
-    /// Queue a full-text `didChange` of `text`. No-op when the text did not change.
+    /// Queue a full-text `didChange` of `text` (the one debounce layer is [`LspHub::change`]).
+    /// No-op when the text did not change.
     fn sync_text(&mut self, path: &Path, text: &str) {
         let Some(doc) = self.docs.get_mut(path) else { return };
         doc.pending = None;
@@ -231,28 +221,25 @@ impl LspHub {
         }
         doc.text_hash = h;
         doc.version += 1;
-        doc.debouncer.push(path, doc.version, text.to_string());
+        let _rt = runtime::tokio().enter();
+        if let Err(e) = doc.client.did_change_full(path, doc.version, text) {
+            tracing::debug!("didChange for {} failed: {e}", path.display());
+        }
     }
 
     /// Flush pending changes, then `didSave`.
     pub fn save(&mut self, path: &Path) {
         self.flush_pending(path);
         let Some(doc) = self.docs.get(path) else { return };
-        let (client, deb, p) = (doc.client.clone(), doc.debouncer.clone(), path.to_path_buf());
-        runtime::tokio().spawn(async move {
-            deb.flush().await;
-            let _ = client.did_save(&p);
-        });
+        let _rt = runtime::tokio().enter();
+        let _ = doc.client.did_save(path);
     }
 
     pub fn close(&mut self, path: &Path) {
         self.flush_pending(path);
         if let Some(doc) = self.docs.remove(path) {
-            let p = path.to_path_buf();
-            runtime::tokio().spawn(async move {
-                doc.debouncer.flush().await;
-                let _ = doc.client.did_close(&p);
-            });
+            let _rt = runtime::tokio().enter();
+            let _ = doc.client.did_close(path);
         }
     }
 
@@ -273,11 +260,8 @@ impl LspHub {
             None => self.flush_pending(path),
         }
         let doc = self.docs.get(path)?;
-        let (client, deb, p) = (doc.client.clone(), doc.debouncer.clone(), path.to_path_buf());
-        Some(runtime::spawn_bridge(async move {
-            deb.flush().await;
-            f(client, p).await
-        }))
+        let (client, p) = (doc.client.clone(), path.to_path_buf());
+        Some(runtime::spawn_bridge(async move { f(client, p).await }))
     }
 }
 

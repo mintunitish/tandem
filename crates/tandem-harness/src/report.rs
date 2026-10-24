@@ -371,7 +371,7 @@ impl Report {
             }
             None => self.clone(),
         };
-        atomic_write(&path, serde_json::to_string_pretty(&combined)?.as_bytes())?;
+        atomic_write(&path, serde_json::to_string_pretty(&combined)?.as_bytes(), true)?;
         render_dir(dir)
     }
 }
@@ -391,9 +391,9 @@ pub fn render_dir(dir: &Path) -> Result<Report> {
         parts.push(serde_json::from_str::<Report>(&text)?);
     }
     let merged = Report::merge(parts).context("no reports")?;
-    atomic_write(&dir.join("report.json"), serde_json::to_string_pretty(&merged)?.as_bytes())?;
-    atomic_write(&dir.join("report.md"), merged.to_markdown().as_bytes())?;
-    atomic_write(&dir.join("leaderboard.svg"), leaderboard_svg(&merged.date, &merged.leaderboard()).as_bytes())?;
+    atomic_write(&dir.join("report.json"), serde_json::to_string_pretty(&merged)?.as_bytes(), true)?;
+    atomic_write(&dir.join("report.md"), merged.to_markdown().as_bytes(), true)?;
+    atomic_write(&dir.join("leaderboard.svg"), leaderboard_svg(&merged.date, &merged.leaderboard()).as_bytes(), true)?;
     Ok(merged)
 }
 

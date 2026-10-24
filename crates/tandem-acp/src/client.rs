@@ -25,11 +25,17 @@ use tandem_core::{
 use tandem_sandbox::kill::{self, KillSwitch};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
+/// Grace period between SIGTERM and SIGKILL when stopping an agent's process groups.
+pub const AGENT_GRACE: Duration = Duration::from_secs(2);
+
 /// Classifier that marks everything `Review` (tests, demos).
 pub struct DefaultClassifier;
 impl PermissionClassifier for DefaultClassifier {}
 
 type Pending = Arc<Mutex<HashMap<RequestId, oneshot::Sender<String>>>>;
+
+/// `PermissionResolved::option` for a request answered `cancelled` (no matching option).
+pub const CANCELLED: &str = "cancelled";
 
 enum Cmd {
     Prompt(String, oneshot::Sender<Result<StopReason>>),
@@ -79,6 +85,15 @@ impl AcpAgent {
                 "STOP is active; call tandem_acp::reset_stop() before starting agents"
             ));
         }
+        // Defense in depth: callers sanitize custom descriptors when loading them; a
+        // descriptor that is not a built-in never launches with unvalidated capabilities.
+        let sanitized;
+        let desc = if desc.trusted {
+            desc
+        } else {
+            sanitized = tandem_sandbox::descriptor::sanitize(desc.clone(), tandem_sandbox::descriptor::Trust::User);
+            &sanitized
+        };
         let emit = Emit { tx, task };
         let cwd = opts
             .cwd
@@ -148,7 +163,9 @@ impl AcpAgent {
     }
 }
 
-/// SIGTERMs (then SIGKILLs) the agent's process group on drop, off-thread.
+/// SIGTERMs (then SIGKILLs) the agent's process group on drop, on the shared reaper
+/// thread. The session resets the PGID to 0 once it has reaped the leader, so a finished
+/// agent's guard is a no-op and a recycled PGID is never signalled.
 #[derive(Default)]
 struct GroupGuard(Arc<AtomicI32>);
 
@@ -161,7 +178,7 @@ impl GroupGuard {
 impl Drop for GroupGuard {
     fn drop(&mut self) {
         if let Some(pgid) = self.pgid() {
-            std::thread::spawn(move || kill::stop_group(pgid, Duration::from_millis(1500)));
+            kill::stop_group_in_background(pgid, AGENT_GRACE);
         }
     }
 }
@@ -241,14 +258,22 @@ impl AgentHandle {
             .map_err(|_| anyhow!("permission request no longer pending"))
     }
 
-    /// Answer `req` with its option of `kind` (falling back to the same-polarity sibling,
-    /// see [`PermissionRequest::option_for`]); with no such option the request is cancelled.
+    /// Answer `req` with its option of `kind` (or a narrower same-polarity fallback, see
+    /// [`PermissionRequest::option_for`]). With no such option the request is cancelled:
+    /// `PermissionResolved { option: "cancelled" }` is emitted so the UI clears it, then
+    /// the agent is answered `cancelled`.
     pub async fn respond_choice(&self, req: &PermissionRequest, kind: PermissionOptionKind, by: Decider) -> Result<()> {
         match req.option_for(kind) {
             Some(o) => self.respond_permission(PermissionDecision { request: req.id.clone(), option_id: o.id.clone() }, by).await,
             None => {
+                let sender = self.pending.lock().remove(&req.id);
+                if sender.is_some() {
+                    self.emit
+                        .send(AgentEvent::PermissionResolved { request: req.id.clone(), option: CANCELLED.into(), by })
+                        .await;
+                }
                 // Dropping the sender answers the agent with `cancelled`.
-                self.pending.lock().remove(&req.id);
+                drop(sender);
                 Err(anyhow!("request {} has no {kind:?} option; cancelled", req.id))
             }
         }
@@ -323,8 +348,14 @@ impl Session {
             }
         }
         self.pending.lock().clear();
+        // Stop the whole group (and tool groups) while the unreaped leader still pins the
+        // PGID, then reap the leader and forget the PGID so nothing signals it again.
+        if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
+            let _ = tokio::task::spawn_blocking(move || kill::stop_group(pid, AGENT_GRACE)).await;
+        }
         let _ = child.start_kill();
         let _ = child.wait().await;
+        self.pgid.store(0, Ordering::SeqCst);
         if let Some(pid) = pid {
             KillSwitch::global().unregister(pid);
         }

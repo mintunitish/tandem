@@ -92,7 +92,7 @@ impl RecentFiles {
             .map(|p| p.strip_prefix(&self.root).unwrap_or(p).to_string_lossy().into_owned())
             .collect();
         let json = serde_json::to_string_pretty(&Disk { version: 1, files })?;
-        tandem_core::fs::atomic_write(&file, json.as_bytes())?;
+        tandem_core::fs::atomic_write(&file, json.as_bytes(), true)?;
         Ok(())
     }
 }

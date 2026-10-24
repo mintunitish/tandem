@@ -123,6 +123,7 @@ fn descriptor(r: &Row) -> AgentDescriptor {
         install_hint: r.6.into(),
         acp: true,
         auth_note: r.7.into(),
+        trusted: true,
         ..Default::default()
     };
     capabilities(&mut d);
@@ -153,7 +154,8 @@ fn capabilities(d: &mut AgentDescriptor) {
         "claude" => {
             d.env_prefixes = v(&["ANTHROPIC_", "CLAUDE_"]);
             d.home_dirs = v(&[".claude", ".claude.json", ".config/claude"]);
-            d.login_command = Some(v(&["claude"]));
+            // Claude Code signs in with its `/login` slash command.
+            d.login_command = Some(v(&["claude", "/login"]));
             d.badge = badge("C", "D97757");
             d.quota_kind = QuotaKind::Claude;
         }
@@ -267,7 +269,7 @@ pub fn detect_in(path_var: &std::ffi::OsStr) -> Vec<DetectedAgent> {
         .collect()
 }
 
-pub use tandem_core::fs::{is_executable, which_in};
+pub use tandem_core::fs::which_in;
 
 #[cfg(test)]
 mod tests {
@@ -289,7 +291,8 @@ mod tests {
         let ids: std::collections::BTreeSet<_> = builtin().into_iter().map(|d| d.id).collect();
         assert_eq!(ids.len(), AGENTS.len());
         assert_eq!(get("gemini").unwrap().args, vec!["--acp"]);
-        assert!(builtin().iter().all(|d| !d.badge.0.is_empty() && d.login_command.is_some()));
+        assert!(builtin().iter().all(|d| !d.badge.0.is_empty() && d.login_command.is_some() && d.trusted));
+        assert_eq!(get("claude").unwrap().login_command.unwrap(), ["claude", "/login"]);
         let cfg: serde_json::Value = serde_json::from_str(&get("opencode").unwrap().strict_env["OPENCODE_CONFIG_CONTENT"]).unwrap();
         assert_eq!(cfg["permission"]["bash"], "ask");
         assert_eq!(cfg["permission"]["edit"], "allow");

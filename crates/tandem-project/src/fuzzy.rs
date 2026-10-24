@@ -511,3 +511,24 @@ impl FileIndex {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod score_tests {
+    use super::score;
+
+    #[test]
+    fn score_edge_cases() {
+        assert_eq!(score("", "anything"), Some(0));
+        assert_eq!(score("", ""), Some(0));
+        assert_eq!(score("zzz", "src/main.rs"), None);
+        assert_eq!(score("abc", ""), None);
+        assert!(score("main", "src/main.rs").is_some());
+        // Exact name beats a scattered match.
+        assert!(score("main", "src/main.rs") > score("main", "src/my_animation.rs"));
+        // Unicode: matches by bytes/case-insensitively without panicking on char boundaries.
+        assert!(score("ü", "src/über.rs").is_some());
+        assert!(score("日本", "docs/日本語.md").is_some());
+        assert_eq!(score("日本", "docs/中文.md"), None);
+        let _ = score("é", "e\u{301}.rs");
+    }
+}

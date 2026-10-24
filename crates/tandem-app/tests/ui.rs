@@ -21,7 +21,7 @@ fn fixture(name: &str) -> PathBuf {
             // Quota providers stay in-memory (no app-server spawn, no log scans).
             std::env::set_var("TANDEM_QUOTA_OFFLINE", "1");
             std::env::set_var("TANDEM_QUOTA_DIR", base.join("quota"));
-            std::env::set_var("TANDEM_DB_STORE", base.join("db/connections.json"));
+            std::env::set_var(tandem_db::STORE_ENV, base.join("db/connections.json"));
         };
     });
     let root = base.join(name);

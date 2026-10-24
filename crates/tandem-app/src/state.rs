@@ -106,11 +106,125 @@ impl LayoutState {
     }
 }
 
-/// `.tandem/policy.json` inside the project (spec: project-level policy).
-pub fn load_policy(project: &Path) -> tandem_core::Policy {
-    read_json(&project.join(".tandem/policy.json")).unwrap_or_default()
+/// The user's policy, `~/.tandem/policy.json` (default: strict).
+pub fn load_user_policy() -> tandem_core::Policy {
+    read_json(&tandem_home().join("policy.json")).unwrap_or_default()
 }
 
-pub fn save_policy(project: &Path, policy: &tandem_core::Policy) {
-    write_json(&project.join(".tandem/policy.json"), policy);
+/// Writes the user's policy (`~/.tandem/policy.json`, never the project file) off the UI
+/// thread.
+pub fn save_user_policy(policy: &tandem_core::Policy) {
+    match serde_json::to_vec_pretty(policy) {
+        Ok(json) => persist(tandem_home().join("policy.json"), json, true),
+        Err(e) => tracing::warn!("policy: {e}"),
+    }
+}
+
+/// The effective policy for `project`: the user's policy, tightened by the project's
+/// `.tandem/policy.json` ([`tandem_core::Policy::merge_project`]). The second value is a
+/// one-line notification when the project file tried to loosen anything (ignored).
+pub fn load_policy(project: &Path) -> (tandem_core::Policy, Option<String>) {
+    merge_policy(load_user_policy(), &project.join(".tandem/policy.json"))
+}
+
+fn merge_policy(user: tandem_core::Policy, project_file: &Path) -> (tandem_core::Policy, Option<String>) {
+    let Some(project) = read_json::<tandem_core::ProjectPolicy>(project_file) else { return (user, None) };
+    let loose = project.loosening(&user);
+    let merged = tandem_core::Policy::merge_project(&user, &project);
+    if loose.is_empty() {
+        return (merged, None);
+    }
+    tracing::warn!(file = %project_file.display(), fields = ?loose, "project policy tried to loosen the user policy; ignored");
+    let what: Vec<String> = loose
+        .iter()
+        .map(|f| match *f {
+            "sandbox" => "disable sandbox".to_string(),
+            "strict_permissions" => "disable strict permissions".to_string(),
+            "auto_allow_safe" => "enable auto-allow".to_string(),
+            other => format!("set {other}"),
+        })
+        .collect();
+    (merged, Some(format!("Project policy tried to {}; ignored", what.join(", "))))
+}
+
+enum WriteJob {
+    Write { path: std::path::PathBuf, bytes: Vec<u8>, sync: bool },
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// One background writer thread, so writes to the same file land in the order they were
+/// queued.
+fn writer() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<WriteJob>> {
+    static W: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<WriteJob>>> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<WriteJob>();
+        let spawned = std::thread::Builder::new().name("tandem-persist".into()).spawn(move || {
+            for job in rx {
+                match job {
+                    WriteJob::Write { path, bytes, sync } => {
+                        if let Err(e) = tandem_core::fs::atomic_write(&path, &bytes, sync) {
+                            tracing::warn!("saving {}: {e}", path.display());
+                        }
+                    }
+                    WriteJob::Flush(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("persist thread: {e}");
+        }
+        std::sync::Mutex::new(tx)
+    })
+}
+
+/// Write `bytes` to `path` off the UI thread (callers serialize on the UI thread). With
+/// `sync` the file is fsynced. Falls back to a direct write if the writer thread is gone.
+pub fn persist(path: std::path::PathBuf, bytes: Vec<u8>, sync: bool) {
+    let tx = writer().lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(std::sync::mpsc::SendError(WriteJob::Write { path, bytes, sync })) = tx.send(WriteJob::Write { path, bytes, sync }) {
+        let _ = tandem_core::fs::atomic_write(&path, &bytes, sync);
+    }
+}
+
+/// Block until every write queued with [`persist`] so far is on disk (at most 2 s).
+pub fn flush_writes() {
+    let (done, wait) = std::sync::mpsc::channel();
+    let sent = writer().lock().unwrap_or_else(|e| e.into_inner()).send(WriteJob::Flush(done));
+    if sent.is_ok() {
+        let _ = wait.recv_timeout(std::time::Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persist_writes_in_order_and_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a/b.json");
+        for i in 0..50 {
+            persist(f.clone(), i.to_string().into_bytes(), i % 2 == 0);
+        }
+        flush_writes();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "49");
+    }
+
+    #[test]
+    fn project_policy_cannot_loosen() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("policy.json");
+        // Missing project file: the user policy as is.
+        assert_eq!(merge_policy(tandem_core::Policy::default(), &f), (tandem_core::Policy::default(), None));
+        std::fs::write(&f, r#"{"sandbox":false,"trusted_commands":["rm -rf /"],"protected_paths":["secrets"]}"#).unwrap();
+        let (p, note) = merge_policy(tandem_core::Policy::default(), &f);
+        assert!(p.sandbox && p.trusted_commands.is_empty());
+        assert_eq!(p.protected_paths, ["secrets"]);
+        assert_eq!(note.as_deref(), Some("Project policy tried to disable sandbox, set trusted_commands; ignored"));
+        // A full legacy file (every field) that only restates defaults is not a warning.
+        std::fs::write(&f, serde_json::to_string(&tandem_core::Policy::default()).unwrap()).unwrap();
+        assert_eq!(merge_policy(tandem_core::Policy::default(), &f).1, None);
+    }
 }

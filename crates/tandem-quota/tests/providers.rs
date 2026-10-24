@@ -89,6 +89,7 @@ async fn codex_fake_app_server() {
         sessions_dir: None,
         request_timeout: StdDuration::from_secs(5),
         offline: false,
+        agent: "codex".into(),
     };
     let p = codex::CodexProvider::new(opts);
     let rx = p.subscribe();
@@ -170,7 +171,7 @@ fn claude_rate_limit_event_statuses() {
 }
 
 fn claude_opts(dir: &Path) -> claude::ClaudeOptions {
-    claude::ClaudeOptions { projects_dir: Some(dir.join("projects")), calibration_path: Some(dir.join("calibration.json")), offline: false }
+    claude::ClaudeOptions { projects_dir: Some(dir.join("projects")), calibration_path: Some(dir.join("calibration.json")), offline: false, ..Default::default() }
 }
 
 #[tokio::test]
@@ -285,6 +286,12 @@ fn for_agent_follows_quota_kind() {
     assert_eq!(providers::for_agent(&desc("codex", QuotaKind::Codex), Offline).unwrap().agent().as_str(), "codex");
     assert_eq!(providers::for_agent(&desc("x", QuotaKind::AcpGeneric), Offline).unwrap().agent().as_str(), "x");
     assert!(providers::for_agent(&desc("y", QuotaKind::None), Offline).is_none());
+    // Registered under the descriptor's id, not a fixed one.
+    for (id, kind) in [("claude-work", QuotaKind::Claude), ("codex-2", QuotaKind::Codex), ("goose-local", QuotaKind::Goose)] {
+        let p = providers::for_agent(&desc(id, kind), Offline).unwrap();
+        assert_eq!(p.agent().as_str(), id);
+        assert_eq!(p.snapshot().agent.as_str(), id);
+    }
 }
 
 #[tokio::test]

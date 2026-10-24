@@ -7,7 +7,7 @@ pub mod log;
 mod map;
 pub mod registry;
 
-pub use client::{AcpAgent, AgentHandle, DefaultClassifier};
+pub use client::{AGENT_GRACE, AcpAgent, AgentHandle, CANCELLED, DefaultClassifier};
 pub use tandem_core::{McpServerSpec, PermissionClassifier};
 pub use launch::{SpawnOptions, child_env, reset_stop, stop_all};
 pub use log::ReplayLog;

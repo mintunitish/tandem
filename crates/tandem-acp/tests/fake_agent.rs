@@ -219,3 +219,53 @@ async fn missing_binary_is_an_error() {
     .expect("error");
     assert!(err.to_string().contains("failed to start"), "{err}");
 }
+
+/// Runs one turn answering the permission request with `respond_choice(kind)` against a
+/// request whose options were narrowed to `keep`; returns the resolution and tool result.
+async fn choice_turn(keep: &[tandem_core::PermissionOptionKind], kind: tandem_core::PermissionOptionKind) -> (bool, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, rx, _) = start(dir.path()).await;
+    let mut all = Vec::new();
+    let prompt = {
+        let h = &h;
+        async move { h.prompt("do it".into()).await }
+    };
+    let drive = async {
+        let p = loop {
+            if let AgentEvent::PermissionRequested(p) = next(&rx, &mut all).await {
+                break p;
+            }
+        };
+        let mut narrowed = p.clone();
+        narrowed.options.retain(|o| keep.contains(&o.kind));
+        let ok = h.respond_choice(&narrowed, kind, Decider::User).await.is_ok();
+        let AgentEvent::PermissionResolved { request, option, .. } = next(&rx, &mut all).await else { panic!("resolved") };
+        assert_eq!(request, p.id);
+        assert!(!h.is_pending(&p.id));
+        let AgentEvent::ToolCallUpdate(u) = next(&rx, &mut all).await else { panic!("update") };
+        loop {
+            if let AgentEvent::Done { .. } = next(&rx, &mut all).await {
+                break;
+            }
+        }
+        (ok, option, u.content.unwrap_or_default())
+    };
+    let (_, out) = tokio::join!(prompt, drive);
+    h.shutdown().await;
+    out
+}
+
+#[tokio::test]
+async fn respond_choice_without_match_cancels_and_resolves() {
+    use tandem_core::PermissionOptionKind::*;
+    // Reject requested but only an allow is on offer: never resolves to the allow.
+    let (ok, option, content) = choice_turn(&[AllowOnce], RejectOnce).await;
+    assert!(!ok);
+    assert_eq!(option, tandem_acp::CANCELLED);
+    assert!(content.starts_with("permission=cancelled"), "{content}");
+    // AllowAlways falls back to AllowOnce.
+    let (ok, option, content) = choice_turn(&[AllowOnce, RejectOnce], AllowAlways).await;
+    assert!(ok);
+    assert_eq!(option, "allow");
+    assert!(content.starts_with("permission=allow"), "{content}");
+}

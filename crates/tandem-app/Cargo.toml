@@ -38,9 +38,11 @@ tandem-harness.workspace = true
 tandem-terminal.workspace = true
 tandem-project.workspace = true
 tandem-lsp.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
 
 [package.metadata.bundle]
 name = "Tandem"

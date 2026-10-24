@@ -23,7 +23,9 @@ pub enum QuotaKind {
 ///
 /// The capability fields below (env allow-list, config dirs, strict-permission launch,
 /// login command, badge, quota provider) are filled for built-ins by
-/// `tandem_acp::registry`; custom agents may set them in `.tandem/agents.json`.
+/// `tandem_acp::registry`. Custom agents come from `~/.tandem/agents.json` (capabilities
+/// validated by `tandem_sandbox::descriptor::sanitize`) or a project's
+/// `.tandem/agents.json` (capabilities ignored).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AgentDescriptor {
     pub id: AgentId,
@@ -63,6 +65,10 @@ pub struct AgentDescriptor {
     pub badge: (String, String),
     #[serde(default)]
     pub quota_kind: QuotaKind,
+    /// Set only by `tandem_acp::registry` for built-ins. Never read from or written to JSON,
+    /// so a loaded descriptor is never trusted (e.g. it does not inherit its own API key).
+    #[serde(skip)]
+    pub trusted: bool,
 }
 
 /// Stdio MCP server handed to the agent at `session/new`.

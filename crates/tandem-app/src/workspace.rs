@@ -60,6 +60,9 @@ pub struct Workspace {
     last_shift: Option<Instant>,
     shift_down: bool,
     layout_save: Task<()>,
+    window_save: Task<()>,
+    /// Window bounds not yet written (debounced like the layout).
+    pending_window: Option<crate::state::WindowGeometry>,
     _subs: Vec<Subscription>,
 }
 
@@ -200,17 +203,28 @@ impl Workspace {
             }
             ReviewEvent::Applied { .. } => {}
         }));
-        subs.push(cx.observe_window_bounds(window, |_, window, _| {
+        subs.push(cx.observe_window_bounds(window, |this, window, cx| {
             let b = window.bounds();
-            crate::state::WindowGeometry {
+            let geom = crate::state::WindowGeometry {
                 x: f32::from(b.origin.x),
                 y: f32::from(b.origin.y),
                 width: f32::from(b.size.width),
                 height: f32::from(b.size.height),
                 maximized: window.is_maximized(),
-            }
-            .save();
+            };
+            this.save_window(geom, cx);
         }));
+        // Debounced saves still pending when the app quits or the window closes are
+        // written synchronously.
+        subs.push(cx.on_app_quit(|this, cx| {
+            this.flush_persistence(cx);
+            async {}
+        }));
+        let weak = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = weak.update(cx, |this, cx| this.flush_persistence(cx));
+            true
+        });
 
         Self {
             root: root.clone(),
@@ -231,6 +245,8 @@ impl Workspace {
             last_shift: None,
             shift_down: false,
             layout_save: Task::ready(()),
+            window_save: Task::ready(()),
+            pending_window: None,
             _subs: subs,
         }
     }
@@ -252,6 +268,29 @@ impl Workspace {
             cx.background_executor().timer(LAYOUT_SAVE_DEBOUNCE).await;
             cx.background_spawn(async move { layout.save() }).await;
         });
+    }
+
+    /// Persist the window bounds off the UI thread, `LAYOUT_SAVE_DEBOUNCE` after the last move.
+    fn save_window(&mut self, geom: crate::state::WindowGeometry, cx: &mut Context<Self>) {
+        self.pending_window = Some(geom);
+        self.window_save = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LAYOUT_SAVE_DEBOUNCE).await;
+            let Ok(Some(geom)) = this.update(cx, |this, _| this.pending_window.take()) else { return };
+            cx.background_spawn(async move { geom.save() }).await;
+        });
+    }
+
+    /// Write every debounced save now (layout, window bounds, recent files, queued task /
+    /// policy writes). Called on quit and when the window closes.
+    pub fn flush_persistence(&mut self, cx: &mut Context<Self>) {
+        self.layout_save = Task::ready(());
+        self.layout.save();
+        self.window_save = Task::ready(());
+        if let Some(geom) = self.pending_window.take() {
+            geom.save();
+        }
+        self.project_model.update(cx, |m, _| m.flush_recent());
+        crate::state::flush_writes();
     }
 
     /// Stripe click / ⌘N: open the tool window, or hide it when it is already showing.

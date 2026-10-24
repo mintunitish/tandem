@@ -79,12 +79,12 @@ pub fn for_agent(desc: &AgentDescriptor, mode: Mode) -> Option<Arc<dyn QuotaProv
     let offline = mode == Mode::Offline;
     Some(match desc.quota_kind {
         QuotaKind::Claude => {
-            let c = claude::ClaudeProvider::new(claude::ClaudeOptions { offline, ..Default::default() });
+            let c = claude::ClaudeProvider::new(claude::ClaudeOptions { offline, agent: desc.id.clone(), ..Default::default() });
             c.start();
             c
         }
         QuotaKind::Codex => {
-            let c = codex::CodexProvider::new(codex::CodexOptions { offline, ..Default::default() });
+            let c = codex::CodexProvider::new(codex::CodexOptions { offline, agent: desc.id.clone(), ..Default::default() });
             if !offline {
                 let c2 = c.clone();
                 tokio::spawn(async move {
@@ -95,7 +95,7 @@ pub fn for_agent(desc: &AgentDescriptor, mode: Mode) -> Option<Arc<dyn QuotaProv
         }
         QuotaKind::Gemini => Arc::new(gemini::GeminiProvider::new(desc.id.clone())),
         QuotaKind::Goose => {
-            let g = goose::GooseProvider::new(if offline { None } else { goose::default_db_path() });
+            let g = goose::GooseProvider::for_agent(desc.id.clone(), if offline { None } else { goose::default_db_path() });
             g.refresh();
             Arc::new(g)
         }

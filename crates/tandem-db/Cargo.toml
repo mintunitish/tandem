@@ -19,6 +19,7 @@ tracing-subscriber.workspace = true
 tokio.workspace = true
 async-channel.workspace = true
 futures.workspace = true
+chrono.workspace = true
 sqlx = { workspace = true, features = ["bigdecimal"] }
 clap.workspace = true
 regex.workspace = true

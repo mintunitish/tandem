@@ -455,7 +455,7 @@ impl ConnectionStore {
 
     /// Default location (overridable with `TANDEM_DB_STORE`) backed by the Keychain.
     pub fn open_default() -> Result<Self, DbError> {
-        let path = match std::env::var_os("TANDEM_DB_STORE") {
+        let path = match std::env::var_os(crate::STORE_ENV) {
             Some(p) => PathBuf::from(p),
             None => Self::default_path()?,
         };

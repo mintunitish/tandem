@@ -66,7 +66,9 @@ impl ProviderCore {
         self.agent.clone()
     }
     /// Merges a partial observation into the state and broadcasts the result.
-    pub fn apply(&self, delta: QuotaSnapshot) -> QuotaSnapshot {
+    pub fn apply(&self, mut delta: QuotaSnapshot) -> QuotaSnapshot {
+        // Parsers stamp their default agent id; the provider's own id wins.
+        delta.agent = self.agent.clone();
         let merged = {
             let mut st = self.state.lock();
             *st = merge(&st, &delta);

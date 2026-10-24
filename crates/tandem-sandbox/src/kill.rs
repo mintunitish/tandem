@@ -79,26 +79,24 @@ fn signal_group(pgid: i32, sig: i32) -> bool {
     unsafe { libc::kill(-pgid, sig) == 0 }
 }
 
-/// Process groups of every descendant of the processes in group `pgid`, other
-/// than `pgid` itself. Agents (e.g. opencode/bun with `detached: true`) start
-/// tool shells in their own groups, so signalling the agent's group alone
-/// leaves them running. Must be called *before* signalling: once a parent dies
-/// its children are reparented to launchd and the link is lost.
-pub fn descendant_groups(pgid: i32) -> Vec<i32> {
-    if pgid <= 1 {
-        return vec![];
-    }
+/// `(pid, ppid, pgid)` of every process.
+fn snapshot() -> Vec<(i32, i32, i32)> {
     let Ok(out) = Command::new("/bin/ps").args(["-axo", "pid=,ppid=,pgid="]).output() else { return vec![] };
-    let rows: Vec<(i32, i32, i32)> = String::from_utf8_lossy(&out.stdout)
+    String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace().map(|x| x.parse::<i32>().ok());
             Some((it.next()??, it.next()??, it.next()??))
         })
-        .collect();
+        .collect()
+}
+
+/// Groups of every descendant of the processes in `groups`, excluding `groups`, init and
+/// our own group.
+fn descendants_in(rows: &[(i32, i32, i32)], groups: &[i32]) -> Vec<i32> {
     // SAFETY: plain getter.
     let own = unsafe { libc::getpgrp() };
-    let mut seen: Vec<i32> = rows.iter().filter(|r| r.2 == pgid).map(|r| r.0).collect();
+    let mut seen: Vec<i32> = rows.iter().filter(|r| groups.contains(&r.2)).map(|r| r.0).collect();
     let mut i = 0;
     while i < seen.len() {
         let parent = seen[i];
@@ -109,27 +107,80 @@ pub fn descendant_groups(pgid: i32) -> Vec<i32> {
         }
         i += 1;
     }
-    let mut groups: Vec<i32> = Vec::new();
+    let mut out: Vec<i32> = Vec::new();
     for r in rows.iter().filter(|r| seen.contains(&r.0)) {
-        if r.2 != pgid && r.2 > 1 && r.2 != own && !groups.contains(&r.2) {
-            groups.push(r.2);
+        if !groups.contains(&r.2) && r.2 > 1 && r.2 != own && !out.contains(&r.2) {
+            out.push(r.2);
         }
     }
-    groups
+    out
 }
 
-/// Stops one process group and the groups its descendants moved into: SIGTERM (+SIGCONT)
-/// now, SIGKILL whatever is still alive after `grace`. Blocks for at most `grace`.
-/// Returns the groups that were signalled.
-pub fn stop_group(pgid: i32, grace: Duration) -> Vec<i32> {
+/// Process groups of every descendant of the processes in group `pgid`, other
+/// than `pgid` itself. Agents (e.g. opencode/bun with `detached: true`) start
+/// tool shells in their own groups, so signalling the agent's group alone
+/// leaves them running. Must be called *before* signalling: once a parent dies
+/// its children are reparented to launchd and the link is lost.
+pub fn descendant_groups(pgid: i32) -> Vec<i32> {
     if pgid <= 1 {
         return vec![];
     }
-    // Collect descendants first: once the leader dies they are reparented and lost.
-    let mut groups = vec![pgid];
-    groups.extend(descendant_groups(pgid));
-    groups.retain(|g| signal_group(*g, libc::SIGTERM));
+    descendants_in(&snapshot(), &[pgid])
+}
+
+/// Snapshot rounds when freezing a process tree: a process that forks + `setsid`s between
+/// two snapshots is caught by the next one, and frozen processes cannot fork again.
+const FREEZE_ROUNDS: usize = 4;
+
+/// What [`stop_groups`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupStop {
+    /// Groups that received SIGTERM (roots first, then descendants' groups).
+    pub terminated: Vec<i32>,
+    /// Groups still alive after the grace period (leader not exited) that got SIGKILL.
+    pub killed: Vec<i32>,
+}
+
+/// Stops process groups `roots` and every group their descendants moved into.
+///
+/// 1. Freeze: snapshot the process table, SIGSTOP every newly found group, re-snapshot,
+///    until no new group appears (at most [`FREEZE_ROUNDS`]). Freezing first means a
+///    child that forks and `setsid`s after a snapshot is still found by the next one.
+/// 2. SIGTERM + SIGCONT every group, wait up to `grace` for them to exit.
+/// 3. SIGKILL whatever is still alive.
+///
+/// PGIDs `<= 1` are ignored (never signal init or "every process").
+pub fn stop_groups(roots: &[i32], grace: Duration) -> GroupStop {
+    let mut groups: Vec<i32> = Vec::new();
+    for &g in roots {
+        if g > 1 && !groups.contains(&g) {
+            groups.push(g);
+        }
+    }
+    if groups.is_empty() {
+        return GroupStop::default();
+    }
+    // Freeze before discovering descendants: stopped parents keep their children linked.
+    let mut new = groups.clone();
+    for _ in 0..FREEZE_ROUNDS {
+        for g in &new {
+            signal_group(*g, libc::SIGSTOP);
+        }
+        new = descendants_in(&snapshot(), &groups);
+        if new.is_empty() {
+            break;
+        }
+        groups.extend(new.iter().copied());
+    }
+    for g in &new {
+        signal_group(*g, libc::SIGSTOP);
+    }
+    let mut out = GroupStop::default();
     for g in &groups {
+        if signal_group(*g, libc::SIGTERM) {
+            out.terminated.push(*g);
+        }
+        // Stopped processes do not act on SIGTERM until continued.
         signal_group(*g, libc::SIGCONT);
     }
     let deadline = Instant::now() + grace;
@@ -137,11 +188,50 @@ pub fn stop_group(pgid: i32, grace: Duration) -> Vec<i32> {
         std::thread::sleep(Duration::from_millis(25));
     }
     for g in &groups {
-        if group_alive(*g) {
-            signal_group(*g, libc::SIGKILL);
+        let leader_gone = leader_exited(*g);
+        if group_alive(*g) && signal_group(*g, libc::SIGKILL) && !leader_gone {
+            out.killed.push(*g);
         }
     }
-    groups
+    out
+}
+
+/// Stops one process group and the groups its descendants moved into (see
+/// [`stop_groups`]). Blocks for at most `grace` (plus a few `ps` snapshots). Returns the
+/// groups that were signalled. No-op for `pgid <= 1`.
+pub fn stop_group(pgid: i32, grace: Duration) -> Vec<i32> {
+    if pgid <= 1 {
+        return vec![];
+    }
+    stop_groups(&[pgid], grace).terminated
+}
+
+/// [`stop_group`] on one shared background thread, for callers that must not block (drop
+/// handlers). Requests are handled in order.
+pub fn stop_group_in_background(pgid: i32, grace: Duration) {
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Sender, channel};
+    static REAPER: OnceLock<Mutex<Sender<(i32, Duration)>>> = OnceLock::new();
+    if pgid <= 1 {
+        return;
+    }
+    let tx = REAPER.get_or_init(|| {
+        let (tx, rx) = channel::<(i32, Duration)>();
+        let spawned = std::thread::Builder::new().name("tandem-reaper".into()).spawn(move || {
+            for (pgid, grace) in rx {
+                stop_group(pgid, grace);
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("reaper thread: {e}");
+        }
+        Mutex::new(tx)
+    });
+    let sent = tx.lock().unwrap_or_else(|e| e.into_inner()).send((pgid, grace));
+    if sent.is_err() {
+        // No reaper thread: stop inline rather than leak the group.
+        stop_group(pgid, grace);
+    }
 }
 
 impl KillSwitch {
@@ -194,38 +284,11 @@ impl KillSwitch {
 
     pub fn stop_all_with_grace(&self, grace: Duration) -> StopReport {
         self.tripped.store(true, Ordering::SeqCst);
-        let mut entries: Vec<Entry> = std::mem::take(&mut *self.groups.lock()).into_iter().map(|(p, l)| Entry { pgid: p, label: l }).collect();
-        // Tool processes the agent moved into their own groups.
-        for e in entries.clone() {
-            for g in descendant_groups(e.pgid) {
-                if !entries.iter().any(|x| x.pgid == g) {
-                    entries.push(Entry { pgid: g, label: format!("{} (child group)", e.label) });
-                }
-            }
-        }
-        let mut report = StopReport::default();
-        for e in &entries {
-            if signal_group(e.pgid, libc::SIGTERM) {
-                // Stopped processes do not act on SIGTERM until continued.
-                signal_group(e.pgid, libc::SIGCONT);
-                report.terminated.push(e.clone());
-            }
-        }
-        let deadline = Instant::now() + grace;
-        loop {
-            let pending = entries.iter().any(|e| !leader_exited(e.pgid) && group_alive(e.pgid));
-            if !pending || Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        for e in &entries {
-            let leader_gone = leader_exited(e.pgid);
-            if group_alive(e.pgid) && signal_group(e.pgid, libc::SIGKILL) && !leader_gone {
-                report.killed.push(e.clone());
-            }
-        }
-        report
+        let labels: BTreeMap<i32, String> = std::mem::take(&mut *self.groups.lock());
+        let roots: Vec<i32> = labels.keys().copied().collect();
+        let done = stop_groups(&roots, grace);
+        let entry = |g: &i32| Entry { pgid: *g, label: labels.get(g).cloned().unwrap_or_else(|| "child group".into()) };
+        StopReport { terminated: done.terminated.iter().map(entry).collect(), killed: done.killed.iter().map(entry).collect() }
     }
 }
 
@@ -307,5 +370,48 @@ mod tests {
         ks.register(1, "init");
         assert!(ks.entries().is_empty());
         assert!(!signal_group(1, 0));
+        for pgid in [0, 1, -5] {
+            assert!(stop_group(pgid, Duration::from_millis(10)).is_empty(), "{pgid}");
+            assert!(descendant_groups(pgid).is_empty());
+            stop_group_in_background(pgid, Duration::from_millis(10));
+        }
+        assert_eq!(stop_groups(&[0, 1, -5], Duration::from_millis(10)), GroupStop::default());
+    }
+
+    /// A child that `setsid`s itself (its own session and group) is found and stopped.
+    #[test]
+    fn stops_setsid_descendant() {
+        let setsid = if std::path::Path::new("/usr/bin/setsid").exists() {
+            "/usr/bin/setsid sleep 30".to_string()
+        } else if Command::new("python3").arg("-c").arg("import os").output().is_ok_and(|o| o.status.success()) {
+            "python3 -c 'import os, time; os.setsid(); time.sleep(30)'".to_string()
+        } else {
+            eprintln!("skipping: neither setsid nor python3");
+            return;
+        };
+        let mut cmd = Command::new("/bin/sh");
+        // The setsid'd child appears a moment after start, then the shell keeps sleeping.
+        cmd.args(["-c", &format!("(sleep 0.2; {setsid}) & sleep 30")]);
+        configure(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let escaped = loop {
+            let g = descendant_groups(pid);
+            if !g.is_empty() || Instant::now() > deadline {
+                break g;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(!escaped.is_empty(), "setsid child never appeared");
+        let done = stop_groups(&[pid], Duration::from_millis(500));
+        for g in &escaped {
+            assert!(done.terminated.contains(g), "{done:?}");
+        }
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(100));
+        for g in escaped {
+            assert!(!group_alive(g), "setsid group {g} survived");
+        }
     }
 }

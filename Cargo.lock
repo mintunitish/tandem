@@ -8109,7 +8109,9 @@ dependencies = [
  "tandem-sandbox",
  "tandem-skills",
  "tandem-terminal",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8131,6 +8133,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "chrono",
  "clap",
  "futures",
  "libsqlite3-sys",

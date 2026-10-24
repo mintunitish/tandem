@@ -33,3 +33,30 @@ impl Usage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPhase { Plan, Implement, Test, Review, Any }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_sums_tokens_and_keeps_latest_context() {
+        let mut u = Usage { input_tokens: 1, output_tokens: 2, cost_usd: Some(0.5), context_used: Some(100), context_size: Some(1000), ..Default::default() };
+        u.add(&Usage { input_tokens: 10, cache_read_tokens: 3, context_used: Some(40), ..Default::default() });
+        assert_eq!((u.input_tokens, u.output_tokens, u.cache_read_tokens), (11, 2, 3));
+        assert_eq!(u.total(), 16);
+        assert_eq!(u.cost_usd, Some(0.5));
+        // Latest reported context wins, even when smaller (compaction); unreported keeps old.
+        assert_eq!((u.context_used, u.context_size), (Some(40), Some(1000)));
+        u.add(&Usage { cost_usd: Some(0.25), ..Default::default() });
+        assert_eq!(u.cost_usd, Some(0.75));
+        assert_eq!(u.context_used, Some(40));
+    }
+
+    #[test]
+    fn legacy_json_without_context_fields() {
+        let u: Usage = serde_json::from_str(r#"{"input_tokens":5,"output_tokens":6,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":null}"#).unwrap();
+        assert_eq!((u.input_tokens, u.context_used, u.context_size), (5, None, None));
+        let s = serde_json::to_string(&u).unwrap();
+        assert!(!s.contains("context_used"), "{s}");
+    }
+}

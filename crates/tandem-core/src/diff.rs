@@ -46,10 +46,16 @@ pub struct BlameEntry {
     pub permission_by: Option<crate::Decider>,
 }
 
+/// `s` without one trailing `\n` / `\r\n` line terminator.
+pub fn strip_eol(s: &str) -> &str {
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    s.strip_suffix('\r').unwrap_or(s)
+}
+
 /// Line-based hunks between two texts using `similar`, with `context` lines around each change.
 /// With `strip_eol` each line's `\n`/`\r\n` terminator is removed; otherwise kept verbatim
 /// (a last line without one marks "no newline at end of file").
-pub fn hunks_from_texts(old: &str, new: &str, context: usize, strip_eol: bool) -> Vec<Hunk> {
+pub fn hunks_from_texts(old: &str, new: &str, context: usize, strip: bool) -> Vec<Hunk> {
     use similar::{ChangeTag, TextDiff};
     let diff = TextDiff::from_lines(old, new);
     let start = |s: usize, n: usize| if n == 0 { s as u32 } else { s as u32 + 1 };
@@ -67,12 +73,7 @@ pub fn hunks_from_texts(old: &str, new: &str, context: usize, strip_eol: bool) -
                     ChangeTag::Insert => LineKind::Added,
                 };
                 let v = ch.value();
-                let text = if strip_eol {
-                    let s = v.strip_suffix('\n').unwrap_or(v);
-                    s.strip_suffix('\r').unwrap_or(s)
-                } else {
-                    v
-                };
+                let text = if strip { self::strip_eol(v) } else { v };
                 lines.push(DiffLine {
                     kind,
                     old_no: ch.old_index().map(|i| i as u32 + 1),
@@ -129,8 +130,8 @@ impl FileDiff {
                     LineKind::Removed => '-',
                 };
                 match l.text.strip_suffix('\n') {
-                    Some(t) => {
-                        let _ = writeln!(s, "{sign}{}", t.strip_suffix('\r').unwrap_or(t));
+                    Some(_) => {
+                        let _ = writeln!(s, "{sign}{}", strip_eol(&l.text));
                     }
                     None if !keeps_eol => {
                         let _ = writeln!(s, "{sign}{}", l.text);
@@ -142,5 +143,57 @@ impl FileDiff {
             }
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds(h: &Hunk) -> Vec<LineKind> {
+        h.lines.iter().map(|l| l.kind).collect()
+    }
+
+    #[test]
+    fn identical_texts_have_no_hunks() {
+        assert!(hunks_from_texts("a\nb\n", "a\nb\n", 3, true).is_empty());
+        assert!(hunks_from_texts("", "", 3, false).is_empty());
+    }
+
+    #[test]
+    fn empty_old_or_new() {
+        let added = hunks_from_texts("", "a\nb\n", 3, true);
+        assert_eq!(added.len(), 1);
+        assert_eq!(kinds(&added[0]), [LineKind::Added, LineKind::Added]);
+        assert_eq!(added[0].header(), "@@ -0,0 +1,2 @@");
+        let removed = hunks_from_texts("a\n", "", 3, true);
+        assert_eq!(kinds(&removed[0]), [LineKind::Removed]);
+        assert_eq!(removed[0].header(), "@@ -1,1 +0,0 @@");
+        assert_eq!(removed[0].lines[0].old_no, Some(1));
+        assert_eq!(removed[0].lines[0].new_no, None);
+    }
+
+    #[test]
+    fn crlf_and_strip_eol_both_ways() {
+        let (old, new) = ("a\r\nb\r\n", "a\r\nc\r\n");
+        let stripped = hunks_from_texts(old, new, 3, true);
+        assert_eq!(stripped[0].lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        let kept = hunks_from_texts(old, new, 3, false);
+        assert_eq!(kept[0].lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["a\r\n", "b\r\n", "c\r\n"]);
+        assert_eq!(stripped[0].header(), "@@ -1,2 +1,2 @@");
+        assert_eq!(strip_eol("x\r\n"), "x");
+        assert_eq!(strip_eol("x\n"), "x");
+        assert_eq!(strip_eol("x"), "x");
+        assert_eq!(strip_eol("x\n\n"), "x\n");
+    }
+
+    #[test]
+    fn context_window_and_header() {
+        let old: String = (1..=20).map(|i| format!("{i}\n")).collect();
+        let new = old.replace("10\n", "ten\n");
+        let h = hunks_from_texts(&old, &new, 2, true);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].header(), "@@ -8,5 +8,5 @@");
+        assert_eq!(h[0].lines.first().unwrap().text, "8");
     }
 }

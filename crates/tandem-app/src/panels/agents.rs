@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tandem_acp::{AgentHandle, Availability, DetectedAgent};
-use tandem_core::fmt::{ellipsize, fmt_tokens};
+use tandem_core::fmt::fmt_tokens;
 use tandem_core::{
     AgentDescriptor, AgentEvent, AgentId, Decider, PermissionOptionKind, PermissionRequest, Policy, RiskClass, Role, TaskEvent, TaskId,
     TaskPhase, ToolCall, ToolCallId, ToolKind, ToolStatus,
@@ -57,6 +57,12 @@ const TRANSCRIPT_TAIL: usize = 500;
 pub const PRESETS: &[(Preset, &str)] =
     &[(Preset::Lazy, "Lazy"), (Preset::Terse, "Terse"), (Preset::Disciplined, "Disciplined"), (Preset::Ship, "Ship"), (Preset::TandemDefault, "Tandem")];
 
+struct RouteCache {
+    key: (Option<AgentId>, TaskPhase),
+    route: Option<tandem_quota::RouteChoice>,
+    estimate: Option<String>,
+}
+
 pub struct AgentsPanel {
     pub root: PathBuf,
     pub model: AgentsModel,
@@ -70,7 +76,17 @@ pub struct AgentsPanel {
     pub phase: TaskPhase,
     pub presets: HashSet<Preset>,
     pub kill_tripped: bool,
-    expanded: HashSet<(TaskId, ToolCallId)>,
+    /// Expanded tool cards per task (looked up without cloning ids).
+    expanded: HashMap<TaskId, HashSet<ToolCallId>>,
+    /// Composer agent menu `(id, name, install hint)` and the built-ins not installed;
+    /// rebuilt only when `detected` changes.
+    composer_agents: Arc<[(AgentId, String, Option<String>)]>,
+    missing_agents: Arc<[(String, String)]>,
+    /// Composer route chip + estimate, recomputed when quota, finished tasks, agents, the
+    /// phase or the pin change.
+    route_cache: Option<RouteCache>,
+    /// Notifications collected before the workspace subscribed (policy / agents.json).
+    pending_toasts: Vec<SharedString>,
     /// Tasks whose whole transcript is shown (not just the last `TRANSCRIPT_TAIL` events).
     full_transcript: HashSet<TaskId>,
     /// Agent detection still running (the quota pool waits for it).
@@ -96,8 +112,9 @@ impl AgentsPanel {
                 }
             }
         });
+        let (policy, policy_note) = crate::state::load_policy(&root);
         let mut this = Self {
-            policy: crate::state::load_policy(&root),
+            policy,
             root,
             model: AgentsModel::default(),
             detected: vec![],
@@ -108,11 +125,16 @@ impl AgentsPanel {
             phase: TaskPhase::Implement,
             presets: [Preset::Disciplined, Preset::TandemDefault].into_iter().collect(),
             kill_tripped: tandem_sandbox::KillSwitch::global().is_tripped(),
-            expanded: HashSet::new(),
+            expanded: HashMap::new(),
+            composer_agents: Arc::from([]),
+            missing_agents: Arc::from([]),
+            route_cache: None,
+            pending_toasts: policy_note.into_iter().map(SharedString::from).collect(),
             full_transcript: HashSet::new(),
             detecting: true,
             _tick: tick,
         };
+        this.detected_changed();
         this.load_in_background(cx);
         #[cfg(feature = "test-support")]
         this.demo_hooks(cx);
@@ -127,14 +149,21 @@ impl AgentsPanel {
             tokio::task::spawn_blocking(move || (tasks::detect_agents(&root), store::restore(&root))).await.unwrap_or_default()
         });
         cx.spawn(async move |this, cx| {
-            let Ok((detected, restored)) = rx.recv().await else { return };
+            let Ok(((detected, notes), mut restored)) = rx.recv().await else { return };
             let _ = this.update(cx, |this, cx| {
                 // Agents registered meanwhile (custom agents, tests) win over detection.
                 for d in std::mem::replace(&mut this.detected, detected) {
                     this.detected.retain(|x| x.descriptor.id != d.descriptor.id);
                     this.detected.push(d);
                 }
+                this.detected_changed();
                 this.detecting = false;
+                for n in std::mem::take(&mut this.pending_toasts).into_iter().chain(notes.into_iter().map(SharedString::from)) {
+                    cx.emit(AgentsEvent::Toast(n));
+                }
+                // Tasks started before the restore finished are live; drop their stale copies.
+                let live_ids: Vec<TaskId> = this.model.tasks.iter().map(|l| l.id.clone()).collect();
+                restored.retain(|r| !live_ids.contains(&r.id));
                 let n = restored.len();
                 let live = std::mem::replace(&mut this.model.tasks, restored);
                 this.model.selected = if live.is_empty() { n.saturating_sub(1) } else { this.model.selected + n };
@@ -234,8 +263,40 @@ impl AgentsPanel {
         let changed = st != self.model.pool;
         if changed {
             self.model.pool = st;
+            self.route_cache = None;
         }
         changed
+    }
+
+    /// `detected` changed: rebuild the composer's agent lists and the route.
+    fn detected_changed(&mut self) {
+        self.composer_agents = self
+            .detected
+            .iter()
+            .map(|d| {
+                let hint = matches!(d.availability, Availability::Installable).then(|| d.descriptor.install_hint.clone());
+                (d.descriptor.id.clone(), d.descriptor.display_name.clone(), hint)
+            })
+            .collect();
+        self.missing_agents = tasks::builtins()
+            .iter()
+            .filter(|b| !self.detected.iter().any(|d| d.descriptor.id == b.id))
+            .map(|b| (b.display_name.clone(), b.install_hint.clone()))
+            .collect();
+        self.route_cache = None;
+    }
+
+    /// Route chip + estimate for the composer, from the cache when nothing they depend on
+    /// changed.
+    fn refresh_route_cache(&mut self) {
+        let key = (self.pinned.clone(), self.phase);
+        if self.route_cache.as_ref().is_some_and(|c| c.key == key) {
+            return;
+        }
+        let route = self.route();
+        let target = self.pinned.clone().or_else(|| route.as_ref().map(|r| r.agent.clone()));
+        let estimate = target.map(|a| self.estimate_label(&a));
+        self.route_cache = Some(RouteCache { key, route, estimate });
     }
 
     /// Register an extra ACP agent (custom agents, tests).
@@ -243,6 +304,7 @@ impl AgentsPanel {
         self.detected.retain(|d| d.descriptor.id != desc.id);
         let path = PathBuf::from(&desc.command);
         self.detected.push(DetectedAgent { descriptor: desc, availability: Availability::Installed(path) });
+        self.detected_changed();
         cx.notify();
     }
 
@@ -338,7 +400,10 @@ impl AgentsPanel {
         self.ensure_quota(cx);
         let id = tasks::new_task_id(&agent);
         let presets: Vec<Preset> = PRESETS.iter().map(|(p, _)| *p).filter(|p| self.presets.contains(p)).collect();
-        let (mcp, notes) = db::mcp_specs(&self.root);
+        let db::DbAttach { specs: mcp, notes, writable } = db::mcp_specs(&self.root);
+        for conn in writable {
+            cx.emit(AgentsEvent::Toast(format!("This task's agent can write to database `{conn}`").into()));
+        }
         let mut t = AgentTask::new(id.clone(), agent.clone(), prompt.clone(), self.phase);
         t.presets = presets.iter().map(|p| p.name().to_string()).collect();
         t.route_reason = route_reason;
@@ -415,6 +480,8 @@ impl AgentsPanel {
             && Some(t.status) != before
         {
             store::save(&self.root, t);
+            // A finished turn feeds the estimate.
+            self.route_cache = None;
             cx.emit(AgentsEvent::Changed);
         }
     }
@@ -430,7 +497,12 @@ impl AgentsPanel {
             let cmd = command_of(&req.tool_call);
             if !cmd.is_empty() && !self.policy.trusted_commands.contains(&cmd) {
                 self.policy.trusted_commands.push(cmd.clone());
-                crate::state::save_policy(&self.root, &self.policy);
+                // Trusted commands are user-level only (a project file cannot add them).
+                let mut user = crate::state::load_user_policy();
+                if !user.trusted_commands.contains(&cmd) {
+                    user.trusted_commands.push(cmd.clone());
+                    crate::state::save_user_policy(&user);
+                }
                 cx.emit(AgentsEvent::Toast(format!("Trusted for new tasks: {cmd}").into()));
             }
         }
@@ -469,17 +541,21 @@ impl AgentsPanel {
 
     /// Remove the task: its agent, worktree, branch and `.tandem/tasks/<id>`.
     pub fn delete_task(&mut self, task: &TaskId, cx: &mut Context<Self>) {
-        if let Some(h) = self.handles.remove(task) {
-            // The idle agent process still holds the worktree: stop its process group.
-            let _ = spawn_bridge(async move { tokio::task::spawn_blocking(move || h.kill_group(Duration::from_secs(2))).await });
-        }
+        let handle = self.handles.remove(task);
         self.full_transcript.remove(task);
+        self.expanded.remove(task);
         let Some(ix) = self.model.tasks.iter().position(|t| &t.id == task) else { return };
         self.model.tasks.remove(ix);
         self.model.selected = self.model.selected.min(self.model.tasks.len().saturating_sub(1));
+        self.route_cache = None;
         let (root, id) = (self.root.clone(), task.clone());
         let rx = spawn_bridge(async move {
             tokio::task::spawn_blocking(move || {
+                // The idle agent still holds the worktree: stop its process groups first,
+                // then remove the worktree and the task dir.
+                if let Some(h) = handle {
+                    h.kill_group(tandem_acp::AGENT_GRACE);
+                }
                 let r = tandem_git::Repo::open(&root).and_then(|repo| repo.remove_task_worktree(&id, true));
                 let _ = std::fs::remove_dir_all(tasks::task_dir(&root, &id));
                 r.map_err(|e| e.to_string())
@@ -791,8 +867,8 @@ impl AgentsPanel {
                 AgentEvent::ToolCall(tc) | AgentEvent::ToolCallUpdate(tc) => {
                     if seen_tools.insert(&tc.id) {
                         let merged = t.merged_tool(&tc.id).unwrap_or(tc);
-                        let open = self.expanded.contains(&(t.id.clone(), tc.id.clone()));
-                        items.push(self.tool_card(i, &t.id, merged, open, p, cx).into_any_element());
+                        let open = self.expanded.get(&t.id).is_some_and(|e| e.contains(&tc.id));
+                        items.push(self.tool_card(i, t, merged, open, p, cx).into_any_element());
                     }
                 }
                 AgentEvent::Plan { entries } => items.push(
@@ -839,7 +915,7 @@ impl AgentsPanel {
             }
         }
         if let Some(err) = &t.error
-            && !t.events.iter().any(|e| matches!(e, AgentEvent::Error { message } if message == err))
+            && !t.has_error_event
         {
             items.push(h_flex().gap(px(6.)).text_size(px(12.)).text_color(p.error).child(icon(IconName::CircleAlert, 14., p.error)).child(err.clone()).into_any_element());
         }
@@ -905,7 +981,7 @@ impl AgentsPanel {
             .into_any_element()
     }
 
-    fn tool_card(&self, i: usize, task: &TaskId, tc: &ToolCall, open: bool, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn tool_card(&self, i: usize, t: &AgentTask, tc: &ToolCall, open: bool, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let glyph = match tc.kind {
             ToolKind::Read => IconName::FileText,
             ToolKind::Edit => IconName::FileCode,
@@ -923,10 +999,10 @@ impl AgentsPanel {
             ToolStatus::InProgress => (IconName::CircleDot, p.accent),
             ToolStatus::Pending => (IconName::CircleDot, p.muted),
         };
-        let key = (task.clone(), tc.id.clone());
+        let key = (t.id.clone(), tc.id.clone());
         let mut detail: Vec<AnyElement> = Vec::new();
-        if open {
-            let mono = |s: String| {
+        if open && let Some(d) = t.tool_detail(&tc.id) {
+            let mono = |s: SharedString| {
                 div()
                     .px(px(8.))
                     .py(px(6.))
@@ -938,19 +1014,19 @@ impl AgentsPanel {
                     .child(s)
                     .into_any_element()
             };
-            if let Some(r) = &tc.raw_input {
+            if let Some(r) = &d.raw_input {
                 detail.push(mono(r.clone()));
             }
-            for l in &tc.locations {
-                detail.push(div().text_size(px(11.)).text_color(p.muted).child(l.display().to_string()).into_any_element());
+            for l in &d.locations {
+                detail.push(div().text_size(px(11.)).text_color(p.muted).child(l.clone()).into_any_element());
             }
-            if let Some(d) = &tc.diff {
-                detail.push(mono(d.to_patch()));
+            if let Some(patch) = &d.patch {
+                detail.push(mono(patch.clone()));
             }
-            if let Some(c) = &tc.content {
-                detail.push(mono(ellipsize(c, 4000)));
+            if let Some(c) = &d.content {
+                detail.push(mono(c.clone()));
             }
-            if detail.is_empty() {
+            if d.is_empty() {
                 detail.push(div().text_size(px(11.)).text_color(p.muted).child("No input or output reported").into_any_element());
             }
         }
@@ -967,8 +1043,10 @@ impl AgentsPanel {
                     .gap(px(8.))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.expanded.remove(&key) {
-                            this.expanded.insert(key.clone());
+                        let (task, tool) = &key;
+                        let set = this.expanded.entry(task.clone()).or_default();
+                        if !set.remove(tool) {
+                            set.insert(tool.clone());
                         }
                         cx.notify();
                     }))
@@ -1078,7 +1156,10 @@ impl AgentsPanel {
 
     fn render_composer(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let phase = phase_label(self.phase);
-        let route = self.route();
+        let (route, estimate) = match &self.route_cache {
+            Some(c) => (c.route.clone(), c.estimate.clone()),
+            None => (self.route(), None),
+        };
         let (picker_label, picker_avatar): (SharedString, Option<(SharedString, u32)>) = match &self.pinned {
             Some(a) => {
                 let b = self.badge(a);
@@ -1086,7 +1167,6 @@ impl AgentsPanel {
             }
             None => ("Route for me".into(), None),
         };
-        let target = self.chosen_agent().map(|(a, _)| a);
         let chips = PRESETS.iter().enumerate().map(|(i, (preset, label))| {
             let on = self.presets.contains(preset);
             let preset = *preset;
@@ -1146,19 +1226,7 @@ impl AgentsPanel {
                             )
                             .dropdown_menu({
                                 let view = cx.entity();
-                                let agents: Vec<(AgentId, String, Option<String>)> = self
-                                    .detected
-                                    .iter()
-                                    .map(|d| {
-                                        let hint = matches!(d.availability, Availability::Installable).then(|| d.descriptor.install_hint.clone());
-                                        (d.descriptor.id.clone(), d.descriptor.display_name.clone(), hint)
-                                    })
-                                    .collect();
-                                let missing: Vec<(String, String)> = tandem_acp::builtin()
-                                    .into_iter()
-                                    .filter(|b| !agents.iter().any(|(id, _, _)| *id == b.id))
-                                    .map(|b| (b.display_name, b.install_hint))
-                                    .collect();
+                                let (agents, missing) = (self.composer_agents.clone(), self.missing_agents.clone());
                                 move |mut menu, _, _| {
                                     let v = view.clone();
                                     menu = menu.item(PopupMenuItem::new("Route for me (quota headroom)").on_click(move |_, _, cx| {
@@ -1168,7 +1236,7 @@ impl AgentsPanel {
                                         })
                                     }));
                                     menu = menu.separator();
-                                    for (id, name, hint) in &agents {
+                                    for (id, name, hint) in agents.iter() {
                                         let v = view.clone();
                                         let id = id.clone();
                                         let label = match hint {
@@ -1184,7 +1252,7 @@ impl AgentsPanel {
                                     }
                                     if !missing.is_empty() {
                                         menu = menu.separator();
-                                        for (name, hint) in &missing {
+                                        for (name, hint) in missing.iter() {
                                             menu = menu.item(PopupMenuItem::new(format!("{name} not installed: {hint}")).disabled(true));
                                         }
                                     }
@@ -1237,7 +1305,7 @@ impl AgentsPanel {
                                 .child(div().min_w_0().whitespace_nowrap().overflow_hidden().text_ellipsis().text_color(p.muted).child(r.reason)),
                         )
                     })
-                    .children(target.map(|a| div().min_w_0().whitespace_nowrap().overflow_hidden().text_ellipsis().text_size(px(11.)).text_color(p.muted).child(self.estimate_label(&a))))
+                    .children(estimate.map(|e| div().min_w_0().whitespace_nowrap().overflow_hidden().text_ellipsis().text_size(px(11.)).text_color(p.muted).child(e)))
                     .child(div().flex_1())
                     .when(can_reply, |d| {
                         d.child(Button::new("reply").small().label("Reply in task").on_click(cx.listener(|this, _, window, cx| this.submit_reply(window, cx))))
@@ -1343,6 +1411,7 @@ pub fn avatar(letter: impl Into<SharedString>, color: u32, size: f32) -> Div {
 impl Render for AgentsPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_quota(cx);
+        self.refresh_route_cache();
         let p = pal(cx).clone();
         let tasks: Vec<AnyElement> = self.model.tasks.iter().enumerate().rev().map(|(i, t)| self.render_task_row(i, t, &p, cx).into_any_element()).collect();
         let waiting = self.model.waiting_count();

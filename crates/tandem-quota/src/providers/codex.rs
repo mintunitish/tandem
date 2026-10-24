@@ -37,6 +37,8 @@ pub struct CodexOptions {
     pub request_timeout: Duration,
     /// In-memory only: never reads session logs or spawns the app-server.
     pub offline: bool,
+    /// Agent id the snapshots are reported under (the descriptor's id).
+    pub agent: tandem_core::AgentId,
 }
 impl Default for CodexOptions {
     fn default() -> Self {
@@ -46,6 +48,7 @@ impl Default for CodexOptions {
             sessions_dir: Some(tandem_core::fs::home().join(".codex").join("sessions")),
             request_timeout: Duration::from_secs(20),
             offline: false,
+            agent: AGENT.into(),
         }
     }
 }
@@ -264,7 +267,7 @@ fn handle_notification(core: &ProviderCore, method: &str, params: &Value) {
 impl CodexProvider {
     pub fn new(opts: CodexOptions) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
-            core: Arc::new(ProviderCore::new(AGENT.into())),
+            core: Arc::new(ProviderCore::new(opts.agent.clone())),
             opts,
             client: tokio::sync::Mutex::new(None),
             session: Mutex::new(Usage::default()),

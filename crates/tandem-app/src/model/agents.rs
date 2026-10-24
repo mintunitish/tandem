@@ -79,6 +79,38 @@ pub struct AgentTask {
     /// Rendered text per event (text deltas only), built on first use and reset when a delta
     /// grows, so the transcript does not copy every string each frame.
     labels: Vec<OnceCell<SharedString>>,
+    /// Expanded tool-card text per tool call, built on first use and reset on every update.
+    tool_details: HashMap<ToolCallId, OnceCell<ToolDetail>>,
+    /// An `Error` event is in `events` (so the transcript need not scan for it).
+    pub has_error_event: bool,
+}
+
+/// Display text of an expanded tool card.
+#[derive(Clone, Debug, Default)]
+pub struct ToolDetail {
+    pub raw_input: Option<SharedString>,
+    pub locations: Vec<SharedString>,
+    pub patch: Option<SharedString>,
+    /// Content, cut to [`TOOL_CONTENT_MAX`] chars.
+    pub content: Option<SharedString>,
+}
+
+/// Longest tool output shown in a card.
+pub const TOOL_CONTENT_MAX: usize = 4000;
+
+impl ToolDetail {
+    fn of(tc: &ToolCall) -> Self {
+        Self {
+            raw_input: tc.raw_input.clone().map(Into::into),
+            locations: tc.locations.iter().map(|l| l.display().to_string().into()).collect(),
+            patch: tc.diff.as_ref().map(|d| d.to_patch().into()),
+            content: tc.content.as_deref().map(|c| tandem_core::fmt::ellipsize(c, TOOL_CONTENT_MAX).into_owned().into()),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw_input.is_none() && self.locations.is_empty() && self.patch.is_none() && self.content.is_none()
+    }
 }
 
 impl AgentTask {
@@ -107,6 +139,8 @@ impl AgentTask {
             resolved: HashSet::new(),
             pending: HashSet::new(),
             labels: vec![],
+            tool_details: HashMap::new(),
+            has_error_event: false,
         }
     }
 
@@ -127,7 +161,7 @@ impl AgentTask {
 
     /// Number of permission requests still waiting for a decision (safe ones are answered by
     /// policy inside tandem-acp and never reach a card).
-    pub fn open_permissions(&self) -> usize {
+    pub fn open_permission_count(&self) -> usize {
         self.pending.len()
     }
 
@@ -138,6 +172,12 @@ impl AgentTask {
     /// Latest merged state of a tool call (initial call + its updates).
     pub fn merged_tool(&self, id: &ToolCallId) -> Option<&ToolCall> {
         self.tools.get(id)
+    }
+
+    /// Cached display text of tool call `id` (expanded card).
+    pub fn tool_detail(&self, id: &ToolCallId) -> Option<&ToolDetail> {
+        let tc = self.tools.get(id)?;
+        Some(self.tool_details.get(id)?.get_or_init(|| ToolDetail::of(tc)))
     }
 
     /// Display text of event `i` when it is a text delta (thoughts get their "Thinking:" prefix).
@@ -160,12 +200,17 @@ impl AgentTask {
     /// Append an event, keeping the tool / permission indexes in sync.
     fn push(&mut self, event: AgentEvent) {
         match &event {
-            AgentEvent::ToolCall(tc) | AgentEvent::ToolCallUpdate(tc) => match self.tools.get_mut(&tc.id) {
-                Some(m) => merge_tool(m, tc),
-                None => {
-                    self.tools.insert(tc.id.clone(), tc.clone());
+            AgentEvent::ToolCall(tc) | AgentEvent::ToolCallUpdate(tc) => {
+                match self.tools.get_mut(&tc.id) {
+                    Some(m) => merge_tool(m, tc),
+                    None => {
+                        self.tools.insert(tc.id.clone(), tc.clone());
+                    }
                 }
-            },
+                // The card text changed: rebuild it on next render.
+                self.tool_details.insert(tc.id.clone(), OnceCell::new());
+            }
+            AgentEvent::Error { .. } => self.has_error_event = true,
             AgentEvent::PermissionRequested(r) if r.risk != RiskClass::Safe && !self.resolved.contains(&r.id) => {
                 self.pending.insert(r.id.clone());
             }
@@ -308,7 +353,7 @@ impl AgentsModel {
         }
         t.push(ev.event);
         // A resolved request may leave others open.
-        if t.status == TaskStatus::Running && t.open_permissions() > 0 {
+        if t.status == TaskStatus::Running && t.open_permission_count() > 0 {
             t.status = TaskStatus::NeedsApproval;
         }
     }
@@ -351,7 +396,7 @@ mod tests {
         m.apply(ev(AgentEvent::ToolCall(tool("t", ToolStatus::Pending))));
         m.apply(ev(AgentEvent::PermissionRequested(req)));
         assert_eq!(m.tasks[0].status, TaskStatus::NeedsApproval);
-        assert_eq!(m.tasks[0].open_permissions(), 1);
+        assert_eq!(m.tasks[0].open_permission_count(), 1);
         m.apply(ev(AgentEvent::PermissionResolved { request: RequestId::from("r1"), option: "allow".into(), by: tandem_core::Decider::User }));
         assert_eq!(m.tasks[0].status, TaskStatus::Running);
         m.apply(ev(AgentEvent::ToolCallUpdate(ToolCall { title: String::new(), ..tool("t", ToolStatus::Completed) })));
@@ -360,5 +405,76 @@ mod tests {
         m.apply(ev(AgentEvent::Done { reason: StopReason::EndTurn }));
         assert_eq!(m.tasks[0].status, TaskStatus::Done);
         assert_eq!(m.running_count(), 0);
+    }
+
+    fn task() -> (AgentsModel, TaskId) {
+        let mut m = AgentsModel::default();
+        let id = TaskId::from("t1");
+        m.tasks.push(AgentTask::new(id.clone(), "claude".into(), "do it".into(), TaskPhase::Implement));
+        (m, id)
+    }
+
+    #[test]
+    fn label_cache_resets_when_a_delta_grows() {
+        let (mut m, id) = task();
+        let ev = |event| TaskEvent { task: id.clone(), event };
+        m.apply(ev(AgentEvent::TextDelta { role: Role::Thought, text: " plan ".into() }));
+        assert_eq!(m.tasks[0].label(0).as_deref(), Some("Thinking: plan"));
+        m.apply(ev(AgentEvent::TextDelta { role: Role::Thought, text: "more".into() }));
+        assert_eq!(m.tasks[0].label(0).as_deref(), Some("Thinking: plan more"));
+        m.apply(ev(AgentEvent::TextDelta { role: Role::Assistant, text: "Hi".into() }));
+        assert_eq!(m.tasks[0].label(1).as_deref(), Some("Hi"));
+        m.apply(ev(AgentEvent::TextDelta { role: Role::Assistant, text: " there".into() }));
+        assert_eq!(m.tasks[0].label(1).as_deref(), Some("Hi there"));
+        assert_eq!(m.tasks[0].label(0).as_deref(), Some("Thinking: plan more"), "earlier labels stay cached");
+        assert_eq!(m.tasks[0].label(5), None);
+    }
+
+    #[test]
+    fn pending_tracking_across_resolves() {
+        let (mut m, id) = task();
+        let ev = |event| TaskEvent { task: id.clone(), event };
+        let req = |rid: &str, risk| PermissionRequest {
+            id: RequestId::from(rid),
+            tool_call: tool("t", ToolStatus::Pending),
+            options: vec![PermissionOption { id: "allow".into(), label: "Allow".into(), kind: PermissionOptionKind::AllowOnce }],
+            risk,
+            reason: String::new(),
+        };
+        let resolve = |rid: &str| AgentEvent::PermissionResolved { request: RequestId::from(rid), option: "allow".into(), by: tandem_core::Decider::User };
+        m.apply(ev(AgentEvent::PermissionRequested(req("a", RiskClass::Review))));
+        m.apply(ev(AgentEvent::PermissionRequested(req("b", RiskClass::Destructive))));
+        m.apply(ev(AgentEvent::PermissionRequested(req("safe", RiskClass::Safe))));
+        assert_eq!(m.tasks[0].open_permission_count(), 2, "safe requests never wait");
+        m.apply(ev(resolve("a")));
+        assert_eq!(m.tasks[0].open_permission_count(), 1);
+        assert_eq!(m.tasks[0].status, TaskStatus::NeedsApproval, "b still open");
+        assert!(m.tasks[0].is_resolved(&RequestId::from("a")));
+        m.apply(ev(resolve("cancelled-unknown")));
+        m.apply(ev(resolve("b")));
+        assert_eq!(m.tasks[0].open_permission_count(), 0);
+        assert_eq!(m.tasks[0].status, TaskStatus::Running);
+        // A resolution that arrives before its request (replay) leaves nothing pending.
+        m.apply(ev(resolve("c")));
+        m.apply(ev(AgentEvent::PermissionRequested(req("c", RiskClass::Review))));
+        assert_eq!(m.tasks[0].open_permission_count(), 0);
+    }
+
+    #[test]
+    fn tool_detail_cache_invalidates_on_update_and_error_flag() {
+        let (mut m, id) = task();
+        let ev = |event| TaskEvent { task: id.clone(), event };
+        let tid = ToolCallId::from("t");
+        m.apply(ev(AgentEvent::ToolCall(tool("t", ToolStatus::InProgress))));
+        let d = m.tasks[0].tool_detail(&tid).unwrap().clone();
+        assert_eq!(d.raw_input.as_deref(), Some("rm -rf build"));
+        assert!(d.content.is_none());
+        m.apply(ev(AgentEvent::ToolCallUpdate(ToolCall { content: Some("x".repeat(TOOL_CONTENT_MAX + 10)), ..tool("t", ToolStatus::Completed) })));
+        let d = m.tasks[0].tool_detail(&tid).unwrap();
+        assert_eq!(d.content.as_ref().unwrap().chars().count(), TOOL_CONTENT_MAX + 1);
+        assert!(m.tasks[0].tool_detail(&ToolCallId::from("nope")).is_none());
+        assert!(!m.tasks[0].has_error_event);
+        m.apply(ev(AgentEvent::Error { message: "boom".into() }));
+        assert!(m.tasks[0].has_error_event);
     }
 }

@@ -55,15 +55,17 @@ impl SpawnOptions {
 
 impl SpawnOptions {
     /// No sandbox, default policy, project root = `cwd`, every permission request
-    /// classified `Review` (tests, demos, harness fakes).
+    /// classified `Review` (tests, demos, harness fakes). `strict_permissions` follows the
+    /// policy.
     pub fn unsandboxed(cwd: impl Into<PathBuf>) -> Self {
         let cwd = canonical(cwd.into());
+        let policy = Policy::default();
         SpawnOptions {
             project_root: cwd.clone(),
             cwd,
-            policy: Policy::default(),
             sandbox: false,
-            strict_permissions: true,
+            strict_permissions: policy.strict_permissions,
+            policy,
             env_overrides: BTreeMap::new(),
             mcp_servers: vec![],
             classifier: Arc::new(crate::DefaultClassifier),
@@ -76,7 +78,7 @@ fn canonical(p: PathBuf) -> PathBuf {
 }
 
 /// Child environment: [`tandem_sandbox::env::scrub`], then the descriptor's `strict_env`
-/// (when `strict`), then `overrides` (code-injection names still refused).
+/// (when `strict`), then `overrides` (code-injection names refused in both).
 pub fn child_env(
     parent: &HashMap<String, String>,
     policy: &Policy,
@@ -85,10 +87,8 @@ pub fn child_env(
     overrides: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut env = tandem_sandbox::env::scrub(parent, policy, desc);
-    if strict {
-        env.extend(desc.strict_env.clone());
-    }
-    for (k, v) in overrides {
+    let strict_env = desc.strict_env.iter().filter(|_| strict);
+    for (k, v) in strict_env.chain(overrides) {
         if !hard_denied(k) && !k.is_empty() && !k.contains('=') && !k.contains('\0') {
             env.insert(k.clone(), v.clone());
         }
@@ -233,6 +233,11 @@ mod tests {
         let e = child_env(&parent, &policy, &desc("goose"), false, &BTreeMap::new());
         assert_eq!(e["GOOSE_MODE"], "auto");
         assert_eq!(child_env(&parent, &policy, &desc("codex"), true, &BTreeMap::new())["INITIAL_AGENT_MODE"], "workspace-write");
+        let mut evil = desc("goose");
+        evil.strict_env.insert("DYLD_INSERT_LIBRARIES".into(), "/evil".into());
+        evil.strict_env.insert("LD_PRELOAD".into(), "/evil".into());
+        let e = child_env(&parent, &policy, &evil, true, &BTreeMap::new());
+        assert!(!e.contains_key("DYLD_INSERT_LIBRARIES") && !e.contains_key("LD_PRELOAD"));
         for id in ["claude", "kiro"] {
             assert!(desc(id).strict_args.is_empty() && desc(id).strict_env.is_empty(), "{id}");
         }

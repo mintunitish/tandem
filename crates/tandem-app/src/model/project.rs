@@ -159,6 +159,19 @@ impl ProjectModel {
         });
     }
 
+    /// Write pending Recent Files touches now (quit / window close).
+    pub fn flush_recent(&mut self) {
+        self._recent_save = Task::ready(());
+        let pending = std::mem::take(&mut self.recent_pending);
+        if pending.is_empty() {
+            return;
+        }
+        let mut r = self.recent.lock();
+        for p in pending {
+            r.touch(p);
+        }
+    }
+
     /// Recent files (absolute, most recent first).
     pub fn recent_files(&self) -> &[PathBuf] {
         &self.recent_list

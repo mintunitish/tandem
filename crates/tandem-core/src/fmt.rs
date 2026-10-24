@@ -12,8 +12,11 @@ pub fn fmt_tokens(t: u64) -> String {
 }
 
 /// First `n` chars of `s`, with `…` appended when it was cut.
-pub fn ellipsize(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n).collect::<String>()) }
+pub fn ellipsize(s: &str, n: usize) -> std::borrow::Cow<'_, str> {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => format!("{}…", &s[..i]).into(),
+        None => s.into(),
+    }
 }
 
 #[cfg(test)]
@@ -27,5 +30,9 @@ mod tests {
         assert_eq!(fmt_tokens(1_250_000), "1.2M");
         assert_eq!(ellipsize("héllo", 3), "hél…");
         assert_eq!(ellipsize("hi", 3), "hi");
+        assert_eq!(ellipsize("abc", 3), "abc");
+        assert_eq!(ellipsize("", 0), "");
+        assert_eq!(ellipsize("ab", 0), "…");
+        assert!(matches!(ellipsize("hi", 3), std::borrow::Cow::Borrowed(_)));
     }
 }

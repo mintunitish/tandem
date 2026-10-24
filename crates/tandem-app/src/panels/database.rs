@@ -323,11 +323,11 @@ impl DatabasePanel {
                 let (view, conn, sql) = (view.clone(), conn.clone(), sql.clone());
                 Button::new("db-confirm-run").small().label(if dangerous { "Run destructive SQL" } else { "Run" }).when(dangerous, |b| b.danger()).when(!dangerous, |b| b.primary()).on_click(
                     move |_, window, cx| {
-                        let confirm = dangerous.then(|| conn.clone());
                         let _ = view.update(cx, |this, cx| {
-                            this.execute(conn.clone(), sql.clone(), class, confirm, cx);
-                            if dangerous && let Err(e) = crate::tasks::db::approve_statement(&this.root, &sql) {
-                                this.status = format!("Approval not recorded for agents: {e}").into();
+                            if dangerous {
+                                this.approve_then_execute(conn.clone(), sql.clone(), class, cx);
+                            } else {
+                                this.execute(conn.clone(), sql.clone(), class, None, cx);
                             }
                         });
                         window.close_dialog(cx);
@@ -367,6 +367,28 @@ impl DatabasePanel {
                         .child(ok),
                 )
         });
+    }
+
+    /// A confirmed destructive statement: record the approval (for agents exposed with
+    /// dangerous SQL, `~/.tandem/db/confirm/`) off the UI thread first, then run it. If the
+    /// approval cannot be written the statement does not run.
+    fn approve_then_execute(&mut self, conn: String, sql: String, class: SqlClass, cx: &mut Context<Self>) {
+        self.status = "Recording approval…".into();
+        cx.notify();
+        let root = self.root.clone();
+        let (c, q) = (conn.clone(), sql.clone());
+        let write = cx.background_spawn(async move { crate::tasks::db::approve_statement(&root, &c, &q) });
+        cx.spawn(async move |this, cx| {
+            let res = write.await;
+            let _ = this.update(cx, |this, cx| match res {
+                Ok(()) => this.execute(conn.clone(), sql, class, Some(conn), cx),
+                Err(e) => {
+                    this.status = format!("Not run: the approval could not be recorded ({e})").into();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Run `sql`; `confirm` is the connection name the user confirmed a Dangerous statement for

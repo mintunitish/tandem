@@ -36,7 +36,7 @@ pub fn passthrough(policy: &Policy, k: &str) -> bool {
 }
 
 /// Enclosing-agent session markers and credential-looking names.
-fn session_or_secret(k: &str) -> bool {
+pub fn session_or_secret(k: &str) -> bool {
     let u = k.to_uppercase();
     u == "CLAUDECODE"
         || u.starts_with("CLAUDE_CODE_")
@@ -46,9 +46,10 @@ fn session_or_secret(k: &str) -> bool {
 }
 
 /// The agent's own API key (`ANTHROPIC_API_KEY` for claude...), which it may inherit so
-/// API-key users can authenticate.
+/// API-key users can authenticate. Built-in (trusted) descriptors only: a custom agent
+/// declaring `env_prefixes: ["OPENAI_"]` must not receive the OpenAI key.
 fn own_api_key(k: &str, agent: &AgentDescriptor) -> bool {
-    k.ends_with("_API_KEY") && agent.env_prefixes.iter().any(|p| k.starts_with(p.as_str()))
+    agent.trusted && k.ends_with("_API_KEY") && agent.env_prefixes.iter().any(|p| k.starts_with(p.as_str()))
 }
 
 /// Drop empty and relative PATH entries (`.`, `bin`): a planted `./ls` must not win.
@@ -107,7 +108,35 @@ mod tests {
             "copilot" => (v(&["COPILOT_"]), v(&["GITHUB_TOKEN"])),
             _ => (vec![], vec![]),
         };
-        AgentDescriptor { id: id.into(), display_name: id.into(), command: id.into(), acp: true, env_prefixes, env_exact, ..Default::default() }
+        let trusted = id != "mystery";
+        AgentDescriptor { id: id.into(), display_name: id.into(), command: id.into(), acp: true, env_prefixes, env_exact, trusted, ..Default::default() }
+    }
+
+    #[test]
+    fn custom_prefixes_and_trust() {
+        let mut p = parent();
+        p.insert("MINE_HOST".into(), "h".into());
+        p.insert("MINE_TOKEN".into(), "t".into());
+        p.insert("MINE_API_KEY".into(), "k".into());
+        p.insert("XDG_RUNTIME_TOKEN".into(), "x".into());
+        p.insert("XDG_SESSION_TOKEN".into(), "x".into());
+        let custom = AgentDescriptor { id: "mine".into(), env_prefixes: vec!["MINE_".into(), "OPENAI_".into()], ..Default::default() };
+        let e = scrub(&p, &Policy::default(), &custom);
+        assert!(e.contains_key("MINE_HOST") && e.contains_key("XDG_CONFIG_HOME"));
+        for k in ["MINE_TOKEN", "MINE_API_KEY", "OPENAI_API_KEY", "XDG_RUNTIME_TOKEN", "XDG_SESSION_TOKEN"] {
+            assert!(!e.contains_key(k), "leaked {k}");
+        }
+        // OPENAI_API_KEY reaches the built-in codex only.
+        for id in ["claude", "gemini", "goose", "opencode", "copilot", "mystery"] {
+            assert!(!scrub(&p, &Policy::default(), &agent(id)).contains_key("OPENAI_API_KEY"), "{id}");
+        }
+        let codex = scrub(&p, &Policy::default(), &agent("codex"));
+        assert!(codex.contains_key("OPENAI_API_KEY") && !codex.contains_key("XDG_RUNTIME_TOKEN"));
+        // The same descriptor loaded from JSON is untrusted.
+        let json = serde_json::to_string(&agent("codex")).unwrap();
+        let loaded: AgentDescriptor = serde_json::from_str(&json).unwrap();
+        assert!(!loaded.trusted);
+        assert!(!scrub(&p, &Policy::default(), &loaded).contains_key("OPENAI_API_KEY"));
     }
 
     fn parent() -> HashMap<String, String> {

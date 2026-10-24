@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tandem_acp::ReplayLog;
-use tandem_core::{AgentId, TaskEvent, TaskId, TaskPhase, Usage};
+use tandem_core::{AgentEvent, AgentId, TaskEvent, TaskId, TaskPhase, Usage};
 
 /// Events kept when restoring a task (the log itself stays complete on disk).
 pub const RESTORE_TAIL: usize = 2000;
@@ -53,9 +53,11 @@ impl TaskRecord {
     }
 }
 
+/// Serializes `t` here (UI thread) and writes `task.json` on the background writer, without
+/// fsync: it is rewritten on every status change and rebuilt from the replay log anyway.
 pub fn save(root: &Path, t: &AgentTask) {
-    if let Ok(json) = serde_json::to_string_pretty(&TaskRecord::of(t)) {
-        let _ = tandem_core::fs::atomic_write(&task_dir(root, &t.id).join("task.json"), json.as_bytes());
+    if let Ok(json) = serde_json::to_vec_pretty(&TaskRecord::of(t)) {
+        crate::state::persist(task_dir(root, &t.id).join("task.json"), json, false);
     }
 }
 
@@ -73,6 +75,14 @@ pub fn restore(root: &Path) -> Vec<AgentTask> {
         model.tasks.push(t);
         let records = ReplayLog::read(d.path()).unwrap_or_default();
         let skip = records.len().saturating_sub(RESTORE_TAIL);
+        // The log is written as events happen; task.json only on status changes, so it can
+        // be stale. A log that ends a turn (`Done` / `Error`) decides the status.
+        let ended = records
+            .iter()
+            .rev()
+            .map(|r| &r.event)
+            .find(|e| !matches!(e, AgentEvent::Raw { .. } | AgentEvent::Usage(_)))
+            .is_some_and(|e| matches!(e, AgentEvent::Done { .. } | AgentEvent::Error { .. }));
         for r in records.into_iter().skip(skip) {
             model.apply(TaskEvent { task: rec.id.clone(), event: r.event });
         }
@@ -83,8 +93,12 @@ pub fn restore(root: &Path) -> Vec<AgentTask> {
         t.finished_at = rec.finished_at.or(t.finished_at);
         t.usage = rec.usage;
         t.route_reason = rec.route_reason;
-        t.error = rec.error;
-        t.status = rec.status;
+        if !ended {
+            t.status = rec.status;
+            t.error = rec.error;
+        } else if t.error.is_none() {
+            t.error = rec.error;
+        }
         t.restored = true;
         if t.status.is_active() {
             t.status = TaskStatus::Failed;
@@ -100,7 +114,7 @@ pub fn restore(root: &Path) -> Vec<AgentTask> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tandem_core::{AgentEvent, Role};
+    use tandem_core::Role;
 
     #[test]
     fn save_and_restore_round_trip() {
@@ -109,6 +123,7 @@ mod tests {
         let mut t = AgentTask::new("codex-1234abcd".into(), "codex".into(), "Fix it\nplease".into(), TaskPhase::Test);
         t.status = TaskStatus::Running;
         save(&root, &t);
+        crate::state::flush_writes();
         let mut log = ReplayLog::open(task_dir(&root, &t.id)).unwrap();
         log.record(&t.id, &AgentEvent::TextDelta { role: Role::User, text: "Fix it".into() }).unwrap();
         log.record(&t.id, &AgentEvent::TextDelta { role: Role::Assistant, text: "Done".into() }).unwrap();
@@ -120,5 +135,34 @@ mod tests {
         assert_eq!(back[0].status, TaskStatus::Failed, "a running task cannot survive a restart");
         assert!(back[0].restored);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn terminal_log_event_beats_stale_task_json() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let mk = |id: &str| {
+            let mut t = AgentTask::new(id.into(), "codex".into(), "x".into(), TaskPhase::Test);
+            t.status = TaskStatus::Running;
+            save(root, &t);
+            t
+        };
+        let (done, failed, open) = (mk("codex-00000001"), mk("codex-00000002"), mk("codex-00000003"));
+        crate::state::flush_writes();
+        let log = |t: &AgentTask, events: &[AgentEvent]| {
+            let mut l = ReplayLog::open(task_dir(root, &t.id)).unwrap();
+            for e in events {
+                l.record(&t.id, e).unwrap();
+            }
+        };
+        log(&done, &[AgentEvent::TextDelta { role: Role::Assistant, text: "ok".into() }, AgentEvent::Done { reason: tandem_core::StopReason::EndTurn }, AgentEvent::Usage(Usage::default())]);
+        log(&failed, &[AgentEvent::Error { message: "boom".into() }]);
+        log(&open, &[AgentEvent::TextDelta { role: Role::Assistant, text: "still going".into() }]);
+        let back = restore(root);
+        let status = |id: &TaskId| back.iter().find(|t| &t.id == id).unwrap().status;
+        assert_eq!(status(&done.id), TaskStatus::Done, "log says the turn ended");
+        assert_eq!(status(&failed.id), TaskStatus::Failed);
+        assert_eq!(back.iter().find(|t| t.id == failed.id).unwrap().error.as_deref(), Some("boom"));
+        assert_eq!(status(&open.id), TaskStatus::Failed, "no terminal event: task.json (running) applies, then marked failed");
     }
 }
