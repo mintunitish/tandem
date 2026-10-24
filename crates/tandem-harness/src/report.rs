@@ -21,6 +21,9 @@ pub enum Status {
     Pass,
     Fail,
     Skip,
+    /// Not run on purpose (e.g. the sandbox blocks the agent's login pending a
+    /// policy decision). Excluded from the leaderboard like `Skip`.
+    Blocked,
 }
 
 impl Status {
@@ -29,6 +32,7 @@ impl Status {
             Status::Pass => "✅",
             Status::Fail => "❌",
             Status::Skip => "⏭",
+            Status::Blocked => "⛔",
         }
     }
 }
@@ -102,7 +106,57 @@ fn fmt_tokens(t: u64) -> String {
     }
 }
 
+impl RunResult {
+    /// Counted in pass rates (not skipped or blocked).
+    pub fn counts(&self) -> bool {
+        !matches!(self.status, Status::Skip | Status::Blocked)
+    }
+    fn key(&self) -> (RunKind, &str, &str, u32) {
+        (self.kind, self.agent.as_str(), self.id.as_str(), self.repeat)
+    }
+}
+
+/// Reads a report JSON; a missing, empty or unparsable file yields `None`
+/// (unparsable is warned about and left in place as `<name>.bad`).
+fn read_report(p: &Path) -> Option<Report> {
+    let text = std::fs::read_to_string(p).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<Report>(&text) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!("warning: ignoring unparsable {}: {e}", p.display());
+            let _ = std::fs::rename(p, p.with_extension("json.bad"));
+            None
+        }
+    }
+}
+
+/// Write via a temp file + rename so a killed run never leaves a truncated JSON.
+fn write_atomic(p: &Path, content: &str) -> Result<()> {
+    let tmp = p.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, p)?;
+    Ok(())
+}
+
 impl Report {
+    /// Results of `newer` replace this report's results with the same
+    /// (kind, agent, id, repeat); other results are kept, new ones appended.
+    pub fn upsert(&mut self, newer: Report) {
+        for r in newer.results {
+            match self.results.iter_mut().find(|x| x.key() == r.key()) {
+                Some(slot) => *slot = r,
+                None => self.results.push(r),
+            }
+        }
+        self.generated_at = self.generated_at.max(newer.generated_at);
+        if !self.runner.split('+').any(|x| x == newer.runner) {
+            self.runner = format!("{}+{}", self.runner, newer.runner);
+        }
+    }
+
     pub fn new(date: &str, runner: &str, results: Vec<RunResult>) -> Self {
         Self { date: date.into(), generated_at: Utc::now(), runner: runner.into(), results }
     }
@@ -149,7 +203,7 @@ impl Report {
             .into_iter()
             .filter_map(|agent| {
                 let runs: Vec<&RunResult> =
-                    self.results.iter().filter(|r| r.agent == agent && r.kind == kind && r.status != Status::Skip).collect();
+                    self.results.iter().filter(|r| r.agent == agent && r.kind == kind && r.counts()).collect();
                 if runs.is_empty() {
                     return None;
                 }
@@ -276,6 +330,15 @@ impl Report {
             md.push('\n');
         }
 
+        let blocked: Vec<&RunResult> = self.results.iter().filter(|r| r.status == Status::Blocked).collect();
+        if !blocked.is_empty() {
+            let _ = writeln!(md, "## Blocked\n");
+            for r in blocked {
+                let _ = writeln!(md, "- `{}` / `{}`: {}", r.agent, r.id, esc_md(&r.reason));
+            }
+            md.push('\n');
+        }
+
         let failures: Vec<&RunResult> = self.results.iter().filter(|r| r.status == Status::Fail).collect();
         if !failures.is_empty() {
             let _ = writeln!(md, "## Failures\n");
@@ -294,7 +357,8 @@ impl Report {
         md
     }
 
-    /// Writes `<kind>.json` (by the kinds present), then re-renders the merged
+    /// Upserts into `<kind>.json` (by the kinds present; results for other
+    /// agents/ids already there are kept), then re-renders the merged
     /// `report.json`, `report.md` and `leaderboard.svg` from every JSON in `dir`.
     pub fn write(&self, dir: &Path) -> Result<Report> {
         std::fs::create_dir_all(dir)?;
@@ -306,7 +370,15 @@ impl Report {
             (false, true) => "bench.json",
             _ => "report.json",
         };
-        std::fs::write(dir.join(name), serde_json::to_string_pretty(self)?)?;
+        let path = dir.join(name);
+        let combined = match read_report(&path) {
+            Some(mut old) => {
+                old.upsert(self.clone());
+                old
+            }
+            None => self.clone(),
+        };
+        write_atomic(&path, &serde_json::to_string_pretty(&combined)?)?;
         render_dir(dir)
     }
 }
@@ -316,10 +388,8 @@ impl Report {
 pub fn render_dir(dir: &Path) -> Result<Report> {
     let mut parts = Vec::new();
     for name in ["conformance.json", "bench.json"] {
-        let p = dir.join(name);
-        if p.exists() {
-            let text = std::fs::read_to_string(&p)?;
-            parts.push(serde_json::from_str::<Report>(&text).with_context(|| format!("parsing {}", p.display()))?);
+        if let Some(r) = read_report(&dir.join(name)) {
+            parts.push(r);
         }
     }
     if parts.is_empty() {
@@ -328,9 +398,9 @@ pub fn render_dir(dir: &Path) -> Result<Report> {
         parts.push(serde_json::from_str::<Report>(&text)?);
     }
     let merged = Report::merge(parts).context("no reports")?;
-    std::fs::write(dir.join("report.json"), serde_json::to_string_pretty(&merged)?)?;
-    std::fs::write(dir.join("report.md"), merged.to_markdown())?;
-    std::fs::write(dir.join("leaderboard.svg"), leaderboard_svg(&merged.date, &merged.leaderboard()))?;
+    write_atomic(&dir.join("report.json"), &serde_json::to_string_pretty(&merged)?)?;
+    write_atomic(&dir.join("report.md"), &merged.to_markdown())?;
+    write_atomic(&dir.join("leaderboard.svg"), &leaderboard_svg(&merged.date, &merged.leaderboard()))?;
     Ok(merged)
 }
 

@@ -41,6 +41,9 @@ struct Common {
     /// Cap every scenario/bench timeout at this many seconds.
     #[arg(long)]
     timeout_s: Option<f64>,
+    /// Do not run anything: record every selected run as `blocked` with this reason.
+    #[arg(long)]
+    blocked: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -83,6 +86,7 @@ fn opts(cli_root: &Path, c: &Common, runner: &str) -> RunOptions {
         o.out_dir = out.clone();
     }
     o.max_timeout_s = c.timeout_s;
+    o.blocked = c.blocked.clone();
     o
 }
 

@@ -39,10 +39,18 @@ impl GroupKill {
 impl Drop for GroupKill {
     fn drop(&mut self) {
         let Some(pgid) = self.0.take() else { return };
-        Self::signal(pgid, "-TERM");
+        // Tool shells the agent started in their own groups (opencode does) would
+        // survive a signal to the agent's group alone; collect them first.
+        let mut groups = vec![pgid];
+        groups.extend(tandem_sandbox::kill::descendant_groups(pgid));
+        for g in &groups {
+            Self::signal(*g, "-TERM");
+        }
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(1500));
-            Self::signal(pgid, "-KILL");
+            for g in groups {
+                Self::signal(g, "-KILL");
+            }
         });
     }
 }

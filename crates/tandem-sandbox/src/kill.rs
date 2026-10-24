@@ -79,6 +79,45 @@ fn signal_group(pgid: i32, sig: i32) -> bool {
     unsafe { libc::kill(-pgid, sig) == 0 }
 }
 
+/// Process groups of every descendant of the processes in group `pgid`, other
+/// than `pgid` itself. Agents (e.g. opencode/bun with `detached: true`) start
+/// tool shells in their own groups, so signalling the agent's group alone
+/// leaves them running. Must be called *before* signalling: once a parent dies
+/// its children are reparented to launchd and the link is lost.
+pub fn descendant_groups(pgid: i32) -> Vec<i32> {
+    if pgid <= 1 {
+        return vec![];
+    }
+    let Ok(out) = Command::new("/bin/ps").args(["-axo", "pid=,ppid=,pgid="]).output() else { return vec![] };
+    let rows: Vec<(i32, i32, i32)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace().map(|x| x.parse::<i32>().ok());
+            Some((it.next()??, it.next()??, it.next()??))
+        })
+        .collect();
+    // SAFETY: plain getter.
+    let own = unsafe { libc::getpgrp() };
+    let mut seen: Vec<i32> = rows.iter().filter(|r| r.2 == pgid).map(|r| r.0).collect();
+    let mut i = 0;
+    while i < seen.len() {
+        let parent = seen[i];
+        for r in rows.iter().filter(|r| r.1 == parent) {
+            if !seen.contains(&r.0) {
+                seen.push(r.0);
+            }
+        }
+        i += 1;
+    }
+    let mut groups: Vec<i32> = Vec::new();
+    for r in rows.iter().filter(|r| seen.contains(&r.0)) {
+        if r.2 != pgid && r.2 > 1 && r.2 != own && !groups.contains(&r.2) {
+            groups.push(r.2);
+        }
+    }
+    groups
+}
+
 impl KillSwitch {
     pub fn new() -> Self {
         Self::default()
@@ -129,7 +168,15 @@ impl KillSwitch {
 
     pub fn stop_all_with_grace(&self, grace: Duration) -> StopReport {
         self.tripped.store(true, Ordering::SeqCst);
-        let entries: Vec<Entry> = std::mem::take(&mut *self.groups.lock()).into_iter().map(|(p, l)| Entry { pgid: p, label: l }).collect();
+        let mut entries: Vec<Entry> = std::mem::take(&mut *self.groups.lock()).into_iter().map(|(p, l)| Entry { pgid: p, label: l }).collect();
+        // Tool processes the agent moved into their own groups.
+        for e in entries.clone() {
+            for g in descendant_groups(e.pgid) {
+                if !entries.iter().any(|x| x.pgid == g) {
+                    entries.push(Entry { pgid: g, label: format!("{} (child group)", e.label) });
+                }
+            }
+        }
         let mut report = StopReport::default();
         for e in &entries {
             if signal_group(e.pgid, libc::SIGTERM) {
@@ -200,6 +247,31 @@ mod tests {
         let st = child.wait().unwrap();
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(st.signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn stops_child_in_its_own_group() {
+        let ks = KillSwitch::new();
+        let mut cmd = Command::new("/bin/sh");
+        // `set -m` (job control) puts the background `sleep` in a new process group.
+        cmd.args(["-c", "set -m; sleep 30 & echo $!; wait"]);
+        cmd.stdout(std::process::Stdio::piped());
+        configure(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id() as i32;
+        ks.register_child(&child, "sh");
+        let mut line = String::new();
+        use std::io::BufRead;
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let sleeper: i32 = line.trim().parse().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_ne!(unsafe { libc::getpgid(sleeper) }, pid, "sleep must be in its own group");
+        assert!(descendant_groups(pid).contains(&sleeper));
+        let r = ks.stop_all_with_grace(Duration::from_millis(500));
+        assert!(r.terminated.iter().any(|e| e.pgid == sleeper), "{r:?}");
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!group_alive(sleeper), "detached child group must be gone");
     }
 
     #[test]

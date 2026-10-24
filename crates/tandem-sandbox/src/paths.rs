@@ -175,6 +175,9 @@ impl Protected {
         if self.dirs.iter().any(|d| is_under(p, d)) {
             return true;
         }
+        if in_trust_store(p) {
+            return false;
+        }
         // Basename rules apply to every component, so `.env/x` and `keys.pem/..` count.
         p.components().any(|c| match c {
             Component::Normal(n) => protected_name(&n.to_string_lossy(), &self.name_globs),
@@ -186,6 +189,28 @@ impl Protected {
 /// Public CA bundles that match `*.pem` but hold no secrets; TLS breaks without them
 /// (`/etc/ssl/cert.pem` for curl, `certifi/cacert.pem` for Python).
 pub const PUBLIC_PEM_NAMES: &[&str] = &["cacert.pem", "cert.pem", "ca-bundle.pem", "ca-certificates.pem", "tls-ca-bundle.pem"];
+
+/// System trust stores. They hold public roots only, but their names match the
+/// `*.keychain` / `*.pem` rules (`SystemRootCertificates.keychain`), and TLS
+/// verification fails ("UnknownIssuer") when they are unreadable. Basename rules are
+/// waived under these prefixes; protected subtrees (e.g. `~/Library/Keychains`,
+/// `/Library/Keychains`) are not. A trailing `*` matches any rest of that component.
+pub const TRUST_STORE_ROOTS: &[&str] = &[
+    "/System/Library/Keychains",
+    "/System/Library/Security",
+    "/private/etc/ssl",
+    "/etc/ssl",
+    "/opt/homebrew/etc/openssl*",
+    "/opt/homebrew/etc/ca-certificates",
+];
+
+/// `p` is inside a system trust store (case-insensitive, lexical).
+pub fn in_trust_store(p: &Path) -> bool {
+    TRUST_STORE_ROOTS.iter().any(|r| match r.strip_suffix('*') {
+        Some(prefix) => lower(p).starts_with(&prefix.to_lowercase()),
+        None => is_under(p, Path::new(r)),
+    })
+}
 
 /// Built-in basename rules plus user globs.
 pub fn protected_name(name: &str, globs: &[String]) -> bool {
@@ -250,6 +275,11 @@ mod tests {
         assert!(!p.matches(Path::new("/private/etc/ssl/cert.pem")));
         assert!(!p.matches(Path::new("/proj/.venv/lib/site-packages/certifi/cacert.pem")));
         assert!(p.matches(Path::new("/Users/u/.ssh/cert.pem")));
+        // System trust stores stay readable; the login keychain does not.
+        assert!(!p.matches(Path::new("/System/Library/Keychains/SystemRootCertificates.keychain")));
+        assert!(!p.matches(Path::new("/opt/homebrew/etc/openssl@3/certs/x.pem")));
+        assert!(p.matches(Path::new("/opt/homebrew/etc/other/x.pem")));
+        assert!(p.matches(Path::new("/Library/Keychains/System.keychain")));
     }
 
     #[test]

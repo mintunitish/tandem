@@ -367,6 +367,22 @@ pub fn profile(spec: &SandboxSpec) -> String {
         subpaths(&reads)
     ));
 
+    // System trust stores (read-only): `SystemRootCertificates.keychain` matches
+    // `*.keychain`, and TLS fails with "UnknownIssuer" without it. Protected subtrees
+    // below (the login keychain, `/Library/Keychains`) are still denied afterwards.
+    let mut trust = String::new();
+    for r in paths::TRUST_STORE_ROOTS {
+        match r.strip_suffix('*') {
+            Some(prefix) => {
+                for s in spellings(Path::new(prefix)) {
+                    trust.push_str(&format!("\n  (regex #\"^{}[^/]*(/|$)\")", ci_regex(&s.to_string_lossy())));
+                }
+            }
+            None => trust.push_str(&subpaths(&[PathBuf::from(r)])),
+        }
+    }
+    p.push_str(&format!("\n; --- system trust stores are readable\n(allow file-read*{trust})\n"));
+
     p.push_str(&format!("\n; --- protected paths: denied even under allowed trees (deny after allow)\n(deny file-read* file-write*{})\n", subpaths(&denied)));
 
     // Mandatory write denies (sandbox-runtime DANGEROUS_FILES / dirs, git hooks).
@@ -494,6 +510,40 @@ mod tests {
     }
 
     #[test]
+    fn tls_works_and_login_keychain_denied() {
+        if !sandbox_works() {
+            eprintln!("skipping: sandbox-exec unavailable or nested sandbox not permitted");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let mut s = spec(&dir);
+        let real_home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        s.home = real_home.clone();
+
+        // The user's login keychain stays unreadable (never print its contents).
+        let login = real_home.join("Library/Keychains/login.keychain-db");
+        if login.exists() {
+            let out = run(&s, "/bin/cat", &[login.to_str().unwrap()]);
+            assert!(!out.status.success(), "login keychain must be denied");
+            assert!(out.stdout.is_empty());
+        }
+
+        // TLS verification against the system trust store (skip when offline).
+        let online = Command::new("/usr/bin/curl")
+            .args(["-sI", "--max-time", "10", "-o", "/dev/null", "https://example.com"])
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false);
+        if !online {
+            eprintln!("skipping TLS check: offline");
+            return;
+        }
+        let out = run(&s, "/usr/bin/curl", &["-sSI", "--max-time", "15", "https://example.com"]);
+        assert!(out.status.success(), "curl https inside sandbox failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
     fn sandbox_exec_enforces_profile() {
         if !sandbox_works() {
             eprintln!("skipping: sandbox-exec unavailable or nested sandbox not permitted");
@@ -527,6 +577,8 @@ mod tests {
         assert!(out.status.success(), "public CA bundle must stay readable");
         let out = run(&s, "/bin/cat", &["/etc/ssl/cert.pem"]);
         assert!(out.status.success(), "system CA bundle must stay readable");
+        let out = run(&s, "/bin/cat", &["/System/Library/Keychains/SystemRootCertificates.keychain"]);
+        assert!(out.status.success(), "system root keychain must stay readable");
 
         for f in [&pem, &env] {
             let out = run(&s, "/bin/cat", &[f.to_str().unwrap()]);

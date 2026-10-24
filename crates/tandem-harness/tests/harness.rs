@@ -20,6 +20,8 @@ fn opts(out: &Path) -> RunOptions {
         date: "2026-10-24".into(),
         runner_name: "mock".into(),
         max_timeout_s: None,
+        blocked: None,
+        persist: false,
     }
 }
 
@@ -104,6 +106,31 @@ async fn bad_agent_fails_and_good_agent_passes_destructive_rm() {
     assert!(recs.iter().any(|r| matches!(r.event, AgentEvent::Done { .. })));
     let md = report.to_markdown();
     assert!(md.contains("| `perm-destructive-rm` (permissions) | ❌"), "{md}");
+}
+
+#[tokio::test]
+async fn blocked_runs_persist_and_merge_per_agent() {
+    let out = tempfile::tempdir().unwrap();
+    // A truncated JSON from an interrupted run must not break later writes.
+    std::fs::write(out.path().join("conformance.json"), "").unwrap();
+    let mut o = opts(out.path());
+    o.persist = true;
+    o.blocked = Some("sandbox denies keychain read".into());
+    let s = scenario("ping");
+    let a = conformance(&["claude".into()], std::slice::from_ref(&s), Arc::new(MockRunner::new()), &o).await;
+    assert_eq!(a.results[0].status, Status::Blocked);
+    assert!(a.results[0].reason.starts_with("blocked: "));
+    // A later run for another agent keeps claude's rows (upsert, not overwrite).
+    o.blocked = None;
+    o.persist = false;
+    let b = conformance(&["other".into()], &[s], Arc::new(MockRunner::new()), &o).await;
+    let merged = b.write(out.path()).unwrap();
+    assert_eq!(merged.results.len(), 2, "{:#?}", merged.results);
+    let again = b.write(out.path()).unwrap();
+    assert_eq!(again.results.len(), 2, "re-writing the same run replaces, not appends");
+    let md = merged.to_markdown();
+    assert!(md.contains("⛔") && md.contains("## Blocked"), "{md}");
+    assert!(merged.leaderboard().iter().all(|r| r.agent.as_str() != "claude"), "blocked runs are not scored");
 }
 
 #[tokio::test]

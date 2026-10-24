@@ -30,6 +30,11 @@ pub struct RunOptions {
     pub runner_name: String,
     /// Upper bound on any scenario/bench timeout (not on `cancel_after_s`).
     pub max_timeout_s: Option<f64>,
+    /// Record every run as [`Status::Blocked`] with this reason instead of running it.
+    pub blocked: Option<String>,
+    /// Upsert each result into `out_dir` as soon as it finishes, so an
+    /// interrupted run keeps what it already measured.
+    pub persist: bool,
 }
 
 impl RunOptions {
@@ -47,6 +52,8 @@ impl RunOptions {
             date,
             runner_name: runner_name.into(),
             max_timeout_s: None,
+            blocked: None,
+            persist: true,
         }
     }
 }
@@ -349,8 +356,32 @@ fn preflight_reason(id: &str, why: &str) -> String {
     let auth = ["auth", "login", "log in", "unauthorized", "401", "403", "credential", "api key", "api_key"]
         .iter()
         .any(|n| lower.contains(n));
-    let tag = if auth { "auth required" } else { "preflight failed" };
+    // e.g. goose configured for a local Ollama that is not running.
+    let unreachable = ["localhost:", "127.0.0.1:", "could not connect", "connection refused"].iter().any(|n| lower.contains(n));
+    let tag = if auth {
+        "auth required"
+    } else if unreachable {
+        "model provider unreachable"
+    } else {
+        "preflight failed"
+    };
     format!("{tag} (`{id}`: {})", crate::eval::tail(why, 160))
+}
+
+fn persist(opts: &RunOptions, r: &RunResult) {
+    if !opts.persist {
+        return;
+    }
+    if let Err(e) = Report::new(&opts.date, &opts.runner_name, vec![r.clone()]).write(&opts.out_dir) {
+        eprintln!("warning: could not persist {}/{}: {e:#}", r.agent, r.id);
+    }
+}
+
+fn blocked_result(opts: &RunOptions, mut r: RunResult) -> Option<RunResult> {
+    let why = opts.blocked.as_ref()?;
+    r.status = Status::Blocked;
+    r.reason = format!("blocked: {why}");
+    Some(r)
 }
 
 /// Runs every scenario against every agent, sequentially. `preflight`
@@ -362,9 +393,16 @@ pub async fn conformance(agents: &[AgentId], scenarios: &[Scenario], runner: Arc
     for agent in agents {
         let mut blocked: Option<String> = None;
         for s in &ordered {
+            let base = base_result(RunKind::Conformance, agent, &s.id, &s.title, Some(s.category.as_str().into()), 0);
+            if let Some(r) = blocked_result(opts, base.clone()) {
+                persist(opts, &r);
+                results.push(r);
+                continue;
+            }
             if let Some(why) = &blocked {
-                let mut r = base_result(RunKind::Conformance, agent, &s.id, &s.title, Some(s.category.as_str().into()), 0);
+                let mut r = base;
                 r.reason = why.clone();
+                persist(opts, &r);
                 results.push(r);
                 continue;
             }
@@ -375,6 +413,7 @@ pub async fn conformance(agents: &[AgentId], scenarios: &[Scenario], runner: Arc
             if s.category == Category::Preflight && r.status == Status::Fail {
                 blocked = Some(preflight_reason(&s.id, &r.reason));
             }
+            persist(opts, &r);
             results.push(r);
         }
     }
@@ -387,10 +426,16 @@ pub async fn bench(agents: &[AgentId], tasks: &[BenchTask], runner: Arc<dyn Agen
     for agent in agents {
         for t in tasks {
             for rep in 0..repeats.max(1) {
+                if let Some(r) = blocked_result(opts, base_result(RunKind::Bench, agent, &t.id, &t.title, None, rep)) {
+                    persist(opts, &r);
+                    results.push(r);
+                    continue;
+                }
                 tracing::info!(agent = %agent, task = %t.id, rep, "bench");
                 eprintln!("[bench] {agent} / {} #{rep} ...", t.id);
                 let r = run_bench_task(agent, t, runner.as_ref(), rep, opts).await;
                 eprintln!("[bench] {agent} / {} #{rep} -> {:?} {}", t.id, r.status, crate::eval::tail(&r.reason, 200));
+                persist(opts, &r);
                 results.push(r);
             }
         }
