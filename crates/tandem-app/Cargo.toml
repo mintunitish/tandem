@@ -41,3 +41,18 @@ tandem-lsp.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
+
+[package.metadata.bundle]
+name = "Tandem"
+identifier = "dev.tandem.ide"
+icon = ["assets/icon/tandem.icns"]
+category = "public.app-category.developer-tools"
+short_description = "Tandem IDE"
+long_description = "Tandem: an IDE for working in tandem with coding agents."
+copyright = "Copyright (c) 2026 Tandem contributors"
+
+[package.metadata.bundle.osx]
+minimum_system_version = "14.0"
+url_schemes = ["tandem"]
+
+# Fonts are embedded via include_bytes!, so no `resources` entry is needed.

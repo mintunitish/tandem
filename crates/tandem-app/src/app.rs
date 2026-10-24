@@ -109,7 +109,8 @@ pub fn run() {
             std::process::exit(2);
         }
     };
-    let project = args.project.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let project = args.project.clone().unwrap_or_else(default_project);
+    remember_project(&project);
     gpui_kit::application().with_assets(AppAssets).run(move |cx| {
         init(args.theme, cx);
         let mut options = window_options(cx);
@@ -173,6 +174,27 @@ fn screenshot(handle: AnyWindowHandle, out: PathBuf, cx: &mut App) {
 fn screenshot(_: AnyWindowHandle, _: PathBuf, cx: &mut App) {
     eprintln!("tandem: --screenshot needs a build with `--features test-support`");
     cx.quit();
+}
+/// Project to open when none is given: the last one opened, else the current
+/// directory, unless that is `/` or `$HOME` (Finder launches start at `/`), in
+/// which case fall back to `$HOME`.
+fn default_project() -> PathBuf {
+    let last = crate::state::tandem_home().join("last-project");
+    if let Ok(s) = std::fs::read_to_string(&last) {
+        let p = PathBuf::from(s.trim());
+        if p.is_dir() { return p; }
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    match std::env::current_dir() {
+        Ok(cwd) if cwd != std::path::Path::new("/") && cwd != home => cwd,
+        _ => home,
+    }
+}
+
+fn remember_project(p: &std::path::Path) {
+    let home = crate::state::tandem_home();
+    let _ = std::fs::create_dir_all(&home);
+    let _ = std::fs::write(home.join("last-project"), p.to_string_lossy().as_bytes());
 }
 
 #[cfg(test)]
