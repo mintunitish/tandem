@@ -14,10 +14,13 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use crate::launch::{self, SpawnOptions};
 use tandem_core::{
     AgentDescriptor, AgentEvent, Decider, Direction, EventTx, PermissionDecision, PermissionOption,
-    PermissionRequest, RequestId, RiskClass, SessionId, StopReason, TaskEvent, TaskId, ToolCall,
+    PermissionOptionKind, PermissionRequest, Policy, RequestId, RiskClass, SessionId, StopReason,
+    TaskEvent, TaskId, ToolCall,
 };
+use tandem_sandbox::kill::{self, KillSwitch};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
 /// Stdio MCP server handed to the agent at `session/new`.
@@ -73,6 +76,8 @@ pub struct AcpAgent;
 
 impl AcpAgent {
     /// Spawn `desc` in `cwd`, run `initialize` + `session/new`, return a live handle.
+    /// Thin wrapper over [`AcpAgent::spawn_opts`]: scrubbed env, no sandbox, every
+    /// permission request classified `Review`.
     pub async fn spawn(
         desc: &AgentDescriptor,
         cwd: PathBuf,
@@ -81,12 +86,12 @@ impl AcpAgent {
         tx: EventTx,
         task: TaskId,
     ) -> Result<AgentHandle> {
-        Self::spawn_with(
+        Self::spawn_classified(
             desc,
             cwd,
             env,
             mcp_servers,
-            Emit { tx, task },
+            (tx, task),
             Arc::new(DefaultClassifier),
         )
         .await
@@ -101,32 +106,56 @@ impl AcpAgent {
         (tx, task): (EventTx, TaskId),
         classifier: Arc<dyn PermissionClassifier>,
     ) -> Result<AgentHandle> {
-        Self::spawn_with(desc, cwd, env, mcp_servers, Emit { tx, task }, classifier).await
+        let opts = SpawnOptions {
+            project_root: cwd.clone(),
+            cwd,
+            policy: Policy::default(),
+            sandbox: false,
+            env_overrides: env,
+            mcp_servers,
+            classifier,
+        };
+        Self::spawn_opts(desc, opts, tx, task).await
     }
 
-    async fn spawn_with(
+    /// Enforced launch: env scrubbed ([`crate::launch::child_env`]), optionally inside
+    /// Seatbelt, own process group registered with the global Kill Switch, and
+    /// permission requests classified by `opts.classifier`. With
+    /// `policy.auto_allow_safe`, `Safe` requests are answered by policy; `Review` and
+    /// `Destructive` always go to the UI / decider.
+    pub async fn spawn_opts(
         desc: &AgentDescriptor,
-        cwd: PathBuf,
-        env: BTreeMap<String, String>,
-        mcp_servers: Vec<McpServerSpec>,
-        emit: Emit,
-        classifier: Arc<dyn PermissionClassifier>,
+        opts: SpawnOptions,
+        tx: EventTx,
+        task: TaskId,
     ) -> Result<AgentHandle> {
-        let cwd = cwd
+        if KillSwitch::global().is_tripped() {
+            return Err(anyhow!(
+                "STOP is active; call tandem_acp::reset_stop() before starting agents"
+            ));
+        }
+        let emit = Emit { tx, task };
+        let cwd = opts
+            .cwd
             .canonicalize()
-            .with_context(|| format!("cwd {}", cwd.display()))?;
-        let mut command = tokio::process::Command::new(&desc.command);
+            .with_context(|| format!("cwd {}", opts.cwd.display()))?;
+        let opts = SpawnOptions { cwd, ..opts };
+        let parent: HashMap<String, String> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let env = launch::child_env(&parent, &opts.policy, desc, &opts.env_overrides);
+        let (program, args) = launch::launch_command(desc, &opts, &env);
+        let mut command = tokio::process::Command::new(&program);
         command
-            .args(&desc.args)
-            .envs(&desc.env)
+            .args(&args)
+            .env_clear()
             .envs(&env)
-            .current_dir(&cwd)
+            .current_dir(&opts.cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
+        kill::configure(command.as_std_mut());
 
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -134,11 +163,12 @@ impl AcpAgent {
         let pending: Pending = Arc::default();
         let ctx = Session {
             agent: desc.id.clone(),
-            cwd,
-            mcp_servers,
+            cwd: opts.cwd,
+            mcp_servers: opts.mcp_servers,
             emit: emit.clone(),
             pending: pending.clone(),
-            classifier,
+            classifier: opts.classifier,
+            auto_allow_safe: opts.policy.auto_allow_safe,
         };
         std::thread::Builder::new()
             .name(format!("acp-{}", desc.id))
@@ -198,6 +228,12 @@ impl AgentHandle {
         &self.session
     }
 
+    /// True while `request` awaits [`AgentHandle::respond_permission`]. False for
+    /// requests already answered by policy (`Safe` + `auto_allow_safe`).
+    pub fn is_pending(&self, request: &RequestId) -> bool {
+        self.pending.lock().contains_key(request)
+    }
+
     /// Answer a `PermissionRequested` event.
     pub async fn respond_permission(
         &self,
@@ -236,6 +272,7 @@ struct Session {
     emit: Emit,
     pending: Pending,
     classifier: Arc<dyn PermissionClassifier>,
+    auto_allow_safe: bool,
 }
 
 impl Session {
@@ -261,6 +298,10 @@ impl Session {
             let _ = ready.send(Err(anyhow!("agent stdio not piped")));
             return;
         };
+        let pid = child.id();
+        if let Some(pid) = pid {
+            KillSwitch::global().register(pid, format!("acp:{}", self.agent));
+        }
         let agent = self.agent.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
@@ -286,6 +327,9 @@ impl Session {
         self.pending.lock().clear();
         let _ = child.start_kill();
         let _ = child.wait().await;
+        if let Some(pid) = pid {
+            KillSwitch::global().unregister(pid);
+        }
     }
 
     async fn connect(
@@ -296,11 +340,12 @@ impl Session {
     ) -> Result<()> {
         let mapper = Arc::new(Mutex::new(UpdateMapper::default()));
         let (emit_n, mapper_n) = (self.emit.clone(), mapper.clone());
-        let (emit_p, mapper_p, pending, classifier) = (
+        let (emit_p, mapper_p, pending, classifier, auto_safe) = (
             self.emit.clone(),
             mapper,
             self.pending.clone(),
             self.classifier.clone(),
+            self.auto_allow_safe,
         );
         let (cwd_r, cwd_w) = (self.cwd.clone(), self.cwd.clone());
 
@@ -324,9 +369,7 @@ impl Session {
                     let call = mapper_p.lock().permission_call(&req.tool_call);
                     let (risk, reason) = classifier.classify(&call);
                     let id = RequestId::new();
-                    let (tx, rx) = oneshot::channel();
-                    pending.lock().insert(id.clone(), tx);
-                    let options = req
+                    let options: Vec<PermissionOption> = req
                         .options
                         .iter()
                         .map(|o| PermissionOption {
@@ -335,15 +378,43 @@ impl Session {
                             kind: map::option_kind(&o.kind),
                         })
                         .collect();
+                    // Only `Safe` is ever answered by policy; `Destructive` always waits
+                    // for a human (or the harness decider), whatever the policy says.
+                    let auto = (auto_safe && risk == RiskClass::Safe)
+                        .then(|| {
+                            options
+                                .iter()
+                                .find(|o| o.kind == PermissionOptionKind::AllowOnce)
+                                .map(|o| o.id.clone())
+                        })
+                        .flatten();
+                    let (tx, rx) = oneshot::channel();
+                    if auto.is_none() {
+                        pending.lock().insert(id.clone(), tx);
+                    }
                     emit_p
                         .send(AgentEvent::PermissionRequested(PermissionRequest {
-                            id,
+                            id: id.clone(),
                             tool_call: call,
                             options,
                             risk,
                             reason,
                         }))
                         .await;
+                    if let Some(option) = auto {
+                        emit_p
+                            .send(AgentEvent::PermissionResolved {
+                                request: id,
+                                option: option.clone(),
+                                by: Decider::Policy,
+                            })
+                            .await;
+                        return responder.respond(acp::RequestPermissionResponse::new(
+                            acp::RequestPermissionOutcome::Selected(
+                                acp::SelectedPermissionOutcome::new(option),
+                            ),
+                        ));
+                    }
                     // Wait off the dispatch loop so other messages keep flowing.
                     cx.spawn(async move {
                         let outcome = match rx.await {

@@ -1,0 +1,14 @@
+/Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/deps/thiserror-16ff797a7e8cfd02.d: /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/build/thiserror-fec309beb0505504/out/private.rs
+
+/Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/deps/libthiserror-16ff797a7e8cfd02.rlib: /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/build/thiserror-fec309beb0505504/out/private.rs
+
+/Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/deps/libthiserror-16ff797a7e8cfd02.rmeta: /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/build/thiserror-fec309beb0505504/out/private.rs
+
+/Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs:
+/Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs:
+/Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs:
+/Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs:
+/Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs:
+/Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/build/thiserror-fec309beb0505504/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/build/thiserror-fec309beb0505504/out

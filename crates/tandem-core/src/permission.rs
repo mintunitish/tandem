@@ -33,6 +33,12 @@ pub struct PermissionRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PermissionDecision { pub request: RequestId, pub option_id: String }
 
+impl std::fmt::Display for RiskClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self { RiskClass::Safe => "safe", RiskClass::Review => "review", RiskClass::Destructive => "destructive" })
+    }
+}
+
 /// Project-level policy. Serialized into `.tandem/policy.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Policy {
@@ -44,9 +50,12 @@ pub struct Policy {
     pub protected_paths: Vec<String>,
     /// Env var names passed through to agents beyond the default allow-list.
     pub env_passthrough: Vec<String>,
+    /// Hosts agents may fetch without asking (docs sites etc.).
+    #[serde(default)]
+    pub fetch_allow_hosts: Vec<String>,
 }
 impl Default for Policy {
     fn default() -> Self {
-        Self { auto_allow_safe: true, sandbox: true, trusted_commands: vec![], protected_paths: vec![], env_passthrough: vec![] }
+        Self { auto_allow_safe: true, sandbox: true, trusted_commands: vec![], protected_paths: vec![], env_passthrough: vec![], fetch_allow_hosts: vec![] }
     }
 }

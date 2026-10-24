@@ -2,6 +2,10 @@
 //!
 //! Prompt text controls behaviour:
 //! - contains "hang": emits one chunk, waits for `session/cancel`, ends with `cancelled`.
+//! - contains "dump-env": a completed `env` tool call whose output is the process
+//!   environment (`K=V` lines), then `end_turn`.
+//! - contains "safe-read": a `read` tool call inside cwd plus a permission request;
+//!   the tool update reports the chosen option.
 //! - otherwise: text, plan, tool call, permission request, fs write/read (inside and
 //!   outside cwd), tool update reflecting the decision, usage, `end_turn`.
 
@@ -87,6 +91,27 @@ fn main() {
                         }
                     }
                     reply(&io, json!({"stopReason":"cancelled"}));
+                    continue;
+                }
+                if text.contains("dump-env") {
+                    let mut vars: Vec<String> = std::env::vars().map(|(k, v)| format!("{k}={v}")).collect();
+                    vars.sort();
+                    io.update(json!({"sessionUpdate":"tool_call","toolCallId":"env","title":"env","kind":"execute",
+                        "status":"completed","rawInput":{"command":"env"},
+                        "content":[{"type":"content","content":{"type":"text","text":vars.join("\n")}}]}));
+                    reply(&io, json!({"stopReason":"end_turn"}));
+                    continue;
+                }
+                if text.contains("safe-read") {
+                    io.update(json!({"sessionUpdate":"tool_call","toolCallId":"r1","title":"Read README.md","kind":"read",
+                        "status":"pending","locations":[{"path":format!("{cwd}/README.md")}]}));
+                    let perm = io.request("session/request_permission", json!({"sessionId":io.session,"toolCall":{"toolCallId":"r1"},
+                        "options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}));
+                    let Some(perm) = perm else { return };
+                    let chosen = perm["result"]["outcome"]["optionId"].as_str().unwrap_or("cancelled").to_string();
+                    io.update(json!({"sessionUpdate":"tool_call_update","toolCallId":"r1","status":"completed",
+                        "content":[{"type":"content","content":{"type":"text","text":format!("permission={chosen}")}}]}));
+                    reply(&io, json!({"stopReason":"end_turn"}));
                     continue;
                 }
                 io.update(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}));

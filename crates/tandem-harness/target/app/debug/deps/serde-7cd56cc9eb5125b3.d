@@ -1,0 +1,14 @@
+/Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/deps/serde-7cd56cc9eb5125b3.d: /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/build/serde-09c7a0d71401f3fc/out/private.rs
+
+/Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/deps/libserde-7cd56cc9eb5125b3.rlib: /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/build/serde-09c7a0d71401f3fc/out/private.rs
+
+/Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/deps/libserde-7cd56cc9eb5125b3.rmeta: /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/build/serde-09c7a0d71401f3fc/out/private.rs
+
+/Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/Users/nik/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/build/serde-09c7a0d71401f3fc/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/nik/WebstormProjects/tandem/crates/tandem-harness/target/app/debug/build/serde-09c7a0d71401f3fc/out

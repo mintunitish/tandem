@@ -32,6 +32,8 @@ impl AgentId {
     pub fn as_str(&self) -> &str { &self.0 }
 }
 impl From<&str> for AgentId { fn from(s: &str) -> Self { Self(s.to_string()) } }
+impl From<String> for AgentId { fn from(s: String) -> Self { Self(s) } }
+impl Default for AgentId { fn default() -> Self { Self("unknown".into()) } }
 impl fmt::Display for AgentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
 }
